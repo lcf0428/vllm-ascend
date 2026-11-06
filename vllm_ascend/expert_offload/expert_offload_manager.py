@@ -29,7 +29,7 @@ from vllm_ascend.expert_offload.h2d_transfer import (
     TorchCopyH2DTransport,
     create_h2d_transport,
 )
-from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
+from vllm_ascend.expert_offload.lrc_policy import CppLRCExpertCachePolicy, LRCExpertCachePolicy
 from vllm_ascend.expert_offload.native_mxfp4_h2d import NativeExpertUploadTask, NativeMXFP4H2DTransport
 from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
@@ -113,6 +113,12 @@ class ExpertOffloadManager:
         from vllm_ascend.ascend_config import get_ascend_config
 
         self.offload_config = get_ascend_config().expert_offload_config
+        cpu = self.offload_config.cpu_moe
+        self._host_hybrid_enabled = cpu.enabled and cpu.transfer_scheduler == "cpu"
+        self._host_weight_worker = None
+        if self._host_hybrid_enabled and self.offload_config.expert_prefetch_enabled:
+            logger.info("[HYBRID-HOST] prefetch disabled: CPU owns demand admission and LRC")
+            self.offload_config.config["expert_prefetch_enabled"] = False
         if get_ascend_config().benchmark_route_stats_enabled is True:
             if getattr(vllm_config.scheduler_config, "async_scheduling", False) is True:
                 raise ValueError("benchmark_route_stats_enabled currently requires --no-async-scheduling for exact final-step acceptance")
@@ -899,7 +905,8 @@ class ExpertOffloadManager:
             self.cache_calls = [0 for _ in range(num_moe_layers)]
             self.last_hit_experts = [[] for _ in range(num_moe_layers)]
             self.last_miss_experts = [[] for _ in range(num_moe_layers)]
-            self.cache_policy = LRCExpertCachePolicy(
+            policy_type = CppLRCExpertCachePolicy if self._host_hybrid_enabled else LRCExpertCachePolicy
+            self.cache_policy = policy_type(
                 num_layers=num_moe_layers,
                 num_experts=self.num_total_experts,
                 # cache_size is informational only (LRC eviction keys on
@@ -1065,7 +1072,7 @@ class ExpertOffloadManager:
         # CPU-MoE diagnostics and the optional ready-poll worker are strictly
         # opt-in. With CPU-MoE disabled the original host prefetch/DMA path is
         # left alone, including its callback scheduling and transport.
-        if self.offload_config.cpu_moe.enabled:
+        if self.offload_config.cpu_moe.enabled and not self._host_hybrid_enabled:
             # Mapped addresses and descriptor buffers must be final before
             # profiling and capture. In particular, device format conversion
             # may replace w.data.
@@ -1093,6 +1100,10 @@ class ExpertOffloadManager:
                             self._cpu_prefetch_dispatcher.capacity)
             else:
                 logger.info("[PREFETCH-CPU-WORKER] unsupported case; keeping ACL host dispatch")
+        if self._host_hybrid_enabled:
+            from vllm_ascend.expert_offload.host_transfer import attach_host_transfers
+            attach_host_transfers(self)
+            logger.info("[HYBRID-HOST] CPU admission/LRC + DMA; independent weight/output readiness")
         t7 = time.perf_counter()
         self._log_cpu_expert_memory()
         logger.info(
@@ -3582,6 +3593,10 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
+        weight_worker = getattr(self, "_host_weight_worker", None)
+        if weight_worker is not None:
+            weight_worker.close()
+            self._host_weight_worker = None
         worker = getattr(self, "_cpu_prefetch_dispatcher", None)
         if worker is not None:
             # close first drains registered prefetch streams while its worker

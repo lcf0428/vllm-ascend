@@ -6,7 +6,7 @@ GGUF/LLAMAFILE MoE implementation.  Two execution modes are supported:
 * **eager** -- submit stages inputs and queues CPU work; wait drains the
   worker pool and returns the pinned host output for mapped combine.
 * **graph** -- a shared communication stream waits for inputs, records D2H,
-  and submits CPU work through a nonblocking host callback. An independent
+  and notifies a CPU worker through an ordered D2H sequence flag. An independent
   completion thread waits for CPU computation and records an ExternalEvent.
   The compute stream waits for that event and combines results directly from
   mapped pinned host memory. No CPU result H2D staging copy is submitted.
@@ -26,8 +26,6 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
-
-from . import async_completion
 
 import torch
 
@@ -147,11 +145,6 @@ _GRAPH_PINNED_BATCH_SIZES: set[int] = set()
 # silently reuse a captured buffer with the wrong shape or dtype.
 _GRAPH_BATCH_SIGNATURES: dict[int, tuple[int, int, torch.dtype, str, int | None]] = {}
 
-# Stream ids this module has registered for callback reporting.  Keyed by the
-# integer stream id rather than the Stream object so the check cannot depend on
-# torch's stream equality semantics.
-_SUBSCRIBED_STREAM_IDS: set[int] = set()
-
 # One CPU communication stream per process/device, shared by all layer backends.
 # Each layer still owns its capture events and task/buffer references.
 _CPU_GRAPH_STREAMS: dict[int, Any] = {}
@@ -223,31 +216,6 @@ def _current_stream(device: torch.device):
         f"got device={device}")
 
 
-def _ensure_subscribed(stream) -> None:
-    """Register ``stream`` for callback reporting, tolerating a prior one.
-
-    ``_launch_host_func`` rejects a stream that no thread has subscribed (ERR
-    107015), while ``aclrtSubscribeReport`` rejects one that is *already*
-    subscribed (ERR 107011) -- and ACL offers no way to ask which state a
-    stream is in.  Other components subscribe this same compute stream
-    (vLLM-Ascend's expert_offload_manager does it on the prefetch path), so
-    "already subscribed" is treated as the state being asked for rather than
-    tracking a private idea of the truth that can drift from the runtime's.
-    """
-    import torch_npu
-
-    stream_id = int(stream.npu_stream)
-    if stream_id in _SUBSCRIBED_STREAM_IDS:
-        return
-    try:
-        torch_npu.npu._subscribe_report(stream)
-    except RuntimeError as exc:
-        text = str(exc)
-        if "107011" not in text and "already" not in text.lower():
-            raise
-    _SUBSCRIBED_STREAM_IDS.add(stream_id)
-
-
 class _KtKernelExpertTask:
     """One in-flight call using kt-kernel's per-layer pinned buffers."""
 
@@ -262,6 +230,14 @@ class _KtKernelExpertTask:
         self._error: BaseException | None = None
         self._finished = False
         self._created_ns = time.perf_counter_ns()
+
+    def wait_for_weights(self):
+        context = getattr(self, "_host_context", None)
+        if context is None:
+            return
+        context.transfer.worker.raise_if_failed()
+        stream = _current_stream(self._hidden_states.device)
+        stream.wait_event(context.ready)
 
     def wait(self) -> torch.Tensor:
         if not self._finished:
@@ -293,10 +269,10 @@ class _KtKernelExpertTask:
 
 
 class _KtKernelGraphExpertTask:
-    """A graph task with CPU callbacks and transfers on a separate stream.
+    """A graph task with polled input readiness on a separate stream.
 
-    Input readiness forks the CPU branch from the compute stream. The host
-    callbacks submit CPU work; wait joins CPU result readiness
+    Input readiness forks the CPU branch from the compute stream. The input
+    poller submits CPU work; wait joins CPU result readiness
     readiness back into the compute stream before the routed results merge.
     """
 
@@ -306,7 +282,7 @@ class _KtKernelGraphExpertTask:
                  hidden_states: torch.Tensor, stream, output_ready,
                  result: torch.Tensor | None, inputs_ready,
                  cpu_stream=None, submitted_event=None,
-                 callback_enqueued_event=None) -> None:
+                 input_published_event=None) -> None:
         self._backend = backend
         self._hidden_states = hidden_states
         self._stream = stream
@@ -315,20 +291,30 @@ class _KtKernelGraphExpertTask:
         self._inputs_ready = inputs_ready
         self._cpu_stream = cpu_stream
         self.submitted_event = submitted_event
-        self._callback_enqueued_event = callback_enqueued_event
+        self._input_published_event = input_published_event
         self._npu_done = None
         self._result: torch.Tensor | None = result
         self._error: BaseException | None = None
         self._finished = False
 
+    def wait_for_weights(self):
+        context = getattr(self, "_host_context", None)
+        if context is None:
+            return
+        context.transfer.worker.raise_if_failed()
+        stream = _current_stream(self._hidden_states.device)
+        # Join the captured input fork before the external weight wait.
+        stream.wait_event(self._input_published_event)
+        stream.wait_event(context.ready)
+
     def wait(self) -> torch.Tensor:
         if not self._finished:
             try:
-                if self._callback_enqueued_event is not None:
+                if self._input_published_event is not None:
                     # Join the captured D2H/submission branch without waiting
                     # on CPU work. External readiness alone does not join a
                     # capture stream back to its origin (CANN 107025).
-                    self._stream.wait_event(self._callback_enqueued_event)
+                    self._stream.wait_event(self._input_published_event)
                 # A graph device dependency, not a host-side synchronize.
                 # CPU result writes must finish before mapped-host reads.
                 # 不是让当前 Python 线程同步等待计算。
@@ -441,8 +427,8 @@ class KtKernelCPUExpertBackend:
         # is therefore the correct default.  Every expert stays resident on the
         # CPU side -- the mask never gated weight loading.
         self._wrapper.load_weights(None)
-        self._async_callback_refs = []
-        if os.environ.get("KT_MOE_POLL_SUBMIT") == "1":
+        self._host_transfer = None
+        if os.environ.get("KT_MOE_POLL_LIBRARY"):
             from . import poll_submission
             poll_submission.prepare(self)
 
@@ -509,6 +495,8 @@ class KtKernelCPUExpertBackend:
         if _graph_capture_active():
             return self._submit_graph(hidden_states, topk_ids, topk_weights)
 
+        if self._host_transfer is not None:
+            return self._submit_host_eager(hidden_states, topk_ids, topk_weights)
         stream_handle = self._stream_handle_provider(hidden_states.device)
         if os.environ.get("KT_MOE_LIFECYCLE_TRACE"):
             from kt_kernel import kt_kernel_ext
@@ -528,6 +516,24 @@ class KtKernelCPUExpertBackend:
         self._in_flight = task
         return task
 
+    def _submit_host_eager(self, hidden_states, topk_ids, topk_weights):
+        self._require_graph_methods()
+        self._pin_graph_batch_size(hidden_states)
+        stream = _current_stream(hidden_states.device)
+        context = self._host_transfer.context(hidden_states, eager=True)
+        context.stage(stream)
+        self._wrapper.copy_inputs_to_cpu_buffers(hidden_states, topk_ids, topk_weights)
+        # Eager alone may synchronize the input stream; captured/replayed work
+        # must use sequence polling instead.
+        stream.synchronize()
+        context.prepare()
+        handle = int(stream.npu_stream)
+        self._launch_pinned_forward((hidden_states, handle))
+        task = _KtKernelExpertTask(self, hidden_states, handle)
+        task._host_context = context
+        self._in_flight = task
+        return task
+
     def _submit_graph(
         self,
         hidden_states: torch.Tensor,
@@ -544,13 +550,16 @@ class KtKernelCPUExpertBackend:
         failure.
         """
         self._require_graph_methods()
+        if not hasattr(self, "_poll_sequence_slots"):
+            raise RuntimeError("Graph CPU MoE requires KT_MOE_POLL_LIBRARY before backend initialization; "
+                               "host callback dispatch has been retired")
         self._pin_graph_batch_size(hidden_states)
 
         import torch_npu
 
         # 主流计算 NPU 专家；通信流 D2H 后只提交 CPU 工作。
         # CPU completion signals readiness for direct mapped-host combine.
-        # 此处捕获图；主机回调在每次 replay 时执行。
+        # 此处捕获图；序号轮询在每次 replay 时通知 CPU。
         stream = _current_stream(hidden_states.device)
         cpu_stream = _shared_cpu_graph_stream(hidden_states.device)
         inputs_ready = torch.npu.Event()
@@ -558,36 +567,39 @@ class KtKernelCPUExpertBackend:
         if not output_ready.npu_event:
             raise RuntimeError("CPU completion requires value-based ExternalEvent support")
         submitted_event = None
-        callback_enqueued_event = torch.npu.Event()
+        context = self._host_transfer.context(hidden_states) if self._host_transfer is not None else None
+        input_published_event = torch.npu.Event()
         # 输入及路由就绪后记录事件，通信流等此事件才开始拷贝。
         # with 切换后续设备操作的入队流，本身不会新建 Python 线程。
         stream.record_event(inputs_ready)
         with torch.npu.stream(cpu_stream):
             # Fork after routing/input production; compute stream can proceed
-            # directly to NPU experts without waiting for either host callback.
+            # to the independent weight-ready boundary without waiting for CPU results.
             cpu_stream.wait_event(inputs_ready)
+            output_ready.reset(cpu_stream)
+            if context is not None:
+                context.stage(cpu_stream)
             # D2H：把 hidden states、专家 ID 和权重拷到 CPU 缓冲区。
             self._wrapper.copy_inputs_to_cpu_buffers(hidden_states, topk_ids,
                                                      topk_weights)
-            if os.environ.get("KT_MOE_POLL_SUBMIT") != "1":
-                _ensure_subscribed(cpu_stream)
-            # 前面的 D2H 完成后，运行时的 CPU 回调线程才执行提交函数。
-            # 提交只把 CPU 任务入队，不等待整层计算完成。
             result = self._wrapper.get_forward_output_buffers(hidden_states)[0]
-            if os.environ.get("KT_MOE_POLL_SUBMIT") == "1":
-                from . import poll_submission
-                poll_submission.record_submission(self, hidden_states, cpu_stream, output_ready)
-            else:
-                async_completion.record_submission(self, hidden_states, cpu_stream, output_ready)
+            from . import poll_submission
+            # Sequence publication follows EVERY input/mapping copy. The CPU
+            # planner masks pinned routes and queues DMA before compute submit;
+            # neither the input producer nor submit worker waits for that DMA.
+            poll_submission.record_submission(
+                self, hidden_states, cpu_stream, output_ready,
+                before_submit=context.prepare if context is not None else None)
             # Join the captured submission branch for graph validity. CPU
             # completion only signals readiness; the compute-stream combine
             # kernel reads the mapped host result directly.
-            cpu_stream.record_event(callback_enqueued_event)
+            cpu_stream.record_event(input_published_event)
         task = _KtKernelGraphExpertTask(
             self, hidden_states, stream, output_ready, result, inputs_ready,
             cpu_stream=None,
             submitted_event=submitted_event,
-            callback_enqueued_event=callback_enqueued_event)
+            input_published_event=input_published_event)
+        task._host_context = context
         self._graph_task_created_ns = time.perf_counter_ns()
         self._in_flight = task
         self._graph_tasks.append(task)
@@ -597,7 +609,7 @@ class KtKernelCPUExpertBackend:
         """Submit half: enqueue this layer's CPU MoE and return at once.
 
         Invoked once per graph replay by the completion/submission worker,
-        after the ACL callback or input poller has queued its request.
+        after the input poller has planned routes and queued its request.
         The stream has already reached input readiness, so the D2H copies recorded
         by ``copy_inputs_to_cpu_buffers`` have landed and no device wait is
         needed here -- and none is legal either, since a ``synchronize`` on
@@ -735,7 +747,7 @@ class KtKernelCPUExpertBackend:
             raise TypeError(
                 "kt-kernel wrapper cannot run the CPU MoE inside a graph; "
                 "missing methods: " + ", ".join(missing)
-                + ". Rebuild kt-kernel with NPU graph host-callback support, "
+                + ". Rebuild kt-kernel with pinned-buffer graph support, "
                 "or run this configuration with --enforce-eager.")
         self._graph_methods_checked = True
 

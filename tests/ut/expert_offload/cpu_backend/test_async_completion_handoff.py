@@ -18,6 +18,7 @@ def modules(monkeypatch):
     base = root / "vllm_ascend/expert_offload/cpu_backend"
     torch = types.ModuleType("torch")
     torch.inference_mode = lambda: lambda fn: fn
+    torch.npu = types.SimpleNamespace(set_device=lambda _: None)
     monkeypatch.setitem(sys.modules, "torch", torch)
     diagnostic = types.ModuleType("vllm_ascend.expert_offload.cpu_prefetch_diagnostics")
     diagnostic.Phase = types.SimpleNamespace(KT_DRAIN_BEGIN=62, KT_DRAIN_END=63,
@@ -213,23 +214,17 @@ def test_poll_path_only_queues_and_telemetry_runs_after_ready(modules):
     assert poll.rows[0]["ready_observed_ns"] == 10
 
 
-def test_acl_callback_only_queues_and_trace_context_is_the_launched_task(modules, monkeypatch):
-    module = modules.async_completion;w = worker(module);events = [];marks = []
+def test_poll_plans_before_compute_submission_without_waiting_for_dma(modules):
+    w = worker(modules.async_completion)
+    events = []
+    poll = modules.poll_submission.PollWorker.__new__(modules.poll_submission.PollWorker)
     backend, hidden, ready = Backend(events), Hidden(), Ready(events)
-    monkeypatch.setattr(module, "worker_for", lambda device: w)
-    module._ACL = object()
-    ext = types.SimpleNamespace(launch_no_block_callback=lambda *a: None,
-        lifecycle_set_context=lambda *a: marks.append(("context",a)),
-        lifecycle_mark=lambda p: marks.append((p,None)))
-    monkeypatch.setitem(sys.modules, "kt_kernel", types.SimpleNamespace(kt_kernel_ext=ext))
-    hidden.device = object()
-    module.record_submission(backend, hidden, types.SimpleNamespace(npu_stream=123), ready)
-    backend._async_callback_refs[0](None)
-    assert not events and not ready.done.is_set()
-    w._process_submission(w.jobs.get(), ext, True)
-    assert marks[0] == ("context", (17,4))
-    assert [m[0] for m in marks[1:]] == ["callback_exit","completion_wait_enter","completion_wait_end","output_ready_recorded"]
-    assert [e[1] for e in events] == ["launch","drain","ready"]
+    poll.channels = [(backend, hidden, 123, ready, object(), lambda: events.append("planned"))]
+    poll.path, poll.rows, poll.completion = None, [], w
+    poll._queue_ready_channel(0, 1, 10, 20)
+    assert events == ["planned"]
+    assert not ready.done.is_set()
+    assert w.jobs.get().backend is backend
 
 
 def test_close_with_pending_request_flushes_final_poll_telemetry(modules, tmp_path):

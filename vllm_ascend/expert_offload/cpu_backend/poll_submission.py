@@ -61,10 +61,10 @@ class PollWorker:
                 self.writer.join(timeout=3)
                 if self.writer.is_alive():raise RuntimeError('CPU poll telemetry writer still active during close')
             self._closed=True
-    def register(self, backend,hidden,stream,ready,hostflag):
+    def register(self, backend,hidden,stream,ready,hostflag,before_submit=None):
         # Publish Python channel metadata before the native scan count grows.
         i=len(self.channels)
-        self.channels.append((backend,hidden,int(stream.npu_stream),ready,hostflag))
+        self.channels.append((backend,hidden,int(stream.npu_stream),ready,hostflag,before_submit))
         native=self.lib.register_flag(hostflag.data_ptr())
         if native!=i:raise RuntimeError('CPU poll registration mismatch')
     def write_rows(self):
@@ -79,7 +79,11 @@ class PollWorker:
             'queued_ns':queued,'submit_end_ns':submitted,'input_tid':input_tid,
             'tid':threading.get_native_id()})
     def _queue_ready_channel(self,channel,generation,observed,dispatch):
-        backend,hidden,handle,ready,_=self.channels[channel]
+        entry=self.channels[channel]
+        backend,hidden,handle,ready,_=entry[:5]
+        before_submit=entry[5] if len(entry)>5 else None
+        if before_submit is not None:
+            before_submit()
         queued=time.monotonic_ns()
         on_submitted=(partial(self._record_submitted,channel,generation,backend,observed,
             dispatch,queued,threading.get_native_id()) if self.path else None)
@@ -111,11 +115,11 @@ def prepare(backend):
     with _LOCK:
         if _WORKER is None:_WORKER=PollWorker(device)
 
-def record_submission(backend,hidden,stream,ready):
+def record_submission(backend,hidden,stream,ready,before_submit=None):
     slot=backend._poll_sequence_used
     if slot>=64:raise RuntimeError('CPU input poll graph slot limit reached')
     backend._poll_sequence_used+=1
     deviceflag,hostflag=backend._poll_sequence_slots[slot]
-    _WORKER.register(backend,hidden,stream,ready,hostflag)
+    _WORKER.register(backend,hidden,stream,ready,hostflag,before_submit)
     deviceflag.add_(1)
     hostflag.copy_(deviceflag,non_blocking=True)

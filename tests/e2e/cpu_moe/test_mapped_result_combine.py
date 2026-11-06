@@ -1,11 +1,16 @@
 """Hardware regression for direct mapped-host CPU result combine."""
 
+import os
+
 import pytest
 
 
 def test_mapped_cpu_result_across_graph_replays(tmp_path):
     torch = pytest.importorskip("torch")
     pytest.importorskip("torch_npu")
+    pytest.importorskip("kt_kernel")
+    if not os.environ.get("KT_MOE_POLL_LIBRARY"):
+        pytest.skip("Graph CPU MoE requires KT_MOE_POLL_LIBRARY")
     if not torch.npu.is_available():
         pytest.skip("Ascend NPU is required")
 

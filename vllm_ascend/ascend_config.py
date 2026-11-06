@@ -1892,6 +1892,8 @@ class CpuMoeConfig:
             raise ValueError("Transfer trace requires the NPU scheduler")
         if self.config["transfer_scheduler"] not in ("cpu", "npu"):
             raise ValueError("cpu_moe.transfer_scheduler must be cpu or npu")
+        if self.config["enabled"] and self.config["transfer_scheduler"] != "cpu":
+            raise ValueError("CPU MoE now uses host admission/DMA; set transfer_scheduler=cpu")
         if self.config["transfer_scheduler"] == "npu" and not self.config["transfer_copy_library"]:
             from vllm_ascend.expert_offload.copy_library import get_default_copy_library
 
@@ -1899,8 +1901,6 @@ class CpuMoeConfig:
         if self.config["transfer_policy"] not in ("first_miss", "frequency", "load_balance"):
             raise ValueError("cpu_moe.transfer_policy must be first_miss, frequency or load_balance")
         if self.config["transfer_policy"] == "load_balance":
-            if self.config["transfer_scheduler"] != "npu":
-                raise ValueError("Load balancing requires the NPU scheduler")
             if self.config["transfer_trace_capacity"]:
                 raise ValueError("Per-core transfer tracing supports single-expert policies only")
         limit = self.config["balance_max_transfers"]

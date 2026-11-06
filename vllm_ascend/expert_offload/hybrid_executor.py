@@ -111,12 +111,24 @@ class HybridExpertExecutor:
             raise TypeError(
                 f"topk ids must use a signed integer dtype so -1 can mark NPU-owned routes; got {topk_ids.dtype}"
             )
+        # Snapshot hits before CPU admission changes residency. Statistics
+        # must not count newly uploaded experts as original cache hits.
+        original_safe_ids = topk_ids.clamp(min=0, max=log2phy.numel() - 1).long()
+        raw_hit_mask = valid & (log2phy[original_safe_ids] >= 0)
+        host_transfer = getattr(self.backend, "_host_transfer", None)
+        cpu_task = None
+        if host_transfer is not None:
+            # Full routes go to the CPU planner. It masks pinned compute inputs
+            # and publishes the new mapping only after DMA has landed.
+            cpu_task = self.backend.submit(
+                layer_idx=self.layer_idx, hidden_states=hidden_states,
+                topk_ids=topk_ids, topk_weights=topk_weights)
+            cpu_task.wait_for_weights()
         valid_routes = (topk_ids >= 0) & (topk_ids < log2phy.numel()) & (topk_weights != 0)
         safe_ids = topk_ids.clamp(min=0, max=log2phy.numel() - 1).long()
         physical_ids = log2phy[safe_ids]
         npu_route_mask = valid_routes & (physical_ids >= 0)
         cpu_route_mask = valid_routes & (physical_ids < 0)
-        raw_hit_mask = valid_routes & (physical_ids >= 0)
         zero = torch.zeros((), dtype=topk_weights.dtype, device=topk_weights.device)
         npu_topk_weights = torch.where(npu_route_mask, topk_weights, zero)
         cpu_topk_weights = torch.where(cpu_route_mask, topk_weights, zero)
@@ -126,12 +138,13 @@ class HybridExpertExecutor:
             torch.full((), -1, dtype=topk_ids.dtype, device=topk_ids.device),
         )
 
-        cpu_task = self.backend.submit(
-            layer_idx=self.layer_idx,
-            hidden_states=hidden_states,
-            topk_ids=cpu_topk_ids,
-            topk_weights=cpu_topk_weights,
-        )
+        if cpu_task is None:
+            cpu_task = self.backend.submit(
+                layer_idx=self.layer_idx,
+                hidden_states=hidden_states,
+                topk_ids=cpu_topk_ids,
+                topk_weights=cpu_topk_weights,
+            )
         collector = getattr(transfer_manager, "_stats", None)
         stats = None
         if collector is not None and getattr(collector, "collecting", False):
@@ -241,10 +254,21 @@ def begin_hybrid_routes(
 
     if is_forward_context_available() and getattr(get_forward_context(), "in_profile_run", False):
         return None
+    # Draft/MTP layers may attach after manager finalization. They borrow the
+    # same DMA worker but own a distinct policy and cache ordinal.
+    worker = getattr(transfer_manager, "_host_weight_worker", None)
+    if worker is not None and getattr(executor.backend, "_host_transfer", None) is None:
+        from vllm_ascend.expert_offload.host_transfer import HostExpertTransfer
+        executor.backend._host_transfer = HostExpertTransfer(transfer_manager, layer, executor.backend, worker)
     backend_max_tokens = executor.backend.max_num_tokens
     if backend_max_tokens <= 0:
         raise ValueError(f"CPU expert backend max_num_tokens must be positive; got {backend_max_tokens}")
     if hidden_states.shape[0] > backend_max_tokens or topk_ids.shape[0] > backend_max_tokens:
+        if getattr(executor.backend, "_host_transfer", None) is not None:
+            from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import _graph_capture_active
+            if _graph_capture_active():
+                raise ValueError("Graph batch exceeds CPU MoE capacity; increase cpu_moe.max_num_tokens. "
+                                 "Host callback paging is not a graph fallback")
         return None
     # The hybrid path replaces update_weights, so it must perform the same
     # prefetch join before reading or modifying the device residency map.

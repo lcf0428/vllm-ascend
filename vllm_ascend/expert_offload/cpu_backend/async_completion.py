@@ -2,7 +2,6 @@
 from __future__ import annotations
 from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import Phase as CpuPrefetchPhase
 import atexit
-import ctypes
 from collections import deque
 from dataclasses import dataclass
 import logging
@@ -16,7 +15,6 @@ import torch
 _LOG = logging.getLogger(__name__)
 _WORKERS = {}
 _LOCK = threading.Lock()
-_ACL = None
 _DEFAULT_COMPLETION_SPIN_US = 3000
 
 
@@ -327,23 +325,3 @@ def worker_for(device):
         if index not in _WORKERS:
             _WORKERS[index] = CompletionWorker(index)
         return _WORKERS[index]
-
-def record_submission(backend, hidden, stream, ready):
-    global _ACL
-    worker = worker_for(hidden.device)
-    if _ACL is None:
-        _ACL = ctypes.CDLL("libascendcl.so")
-        _ACL.aclrtLaunchCallback.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-        _ACL.aclrtLaunchCallback.restype = ctypes.c_int
-    args = (hidden, int(stream.npu_stream))
-    @ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-    def submit(_unused):
-        try:
-            worker.submit(backend, hidden, args[1], ready, trace_callback_exit=True)
-        except BaseException:
-            _LOG.exception("CPU MoE submission failed")
-            os._exit(1)
-    backend._async_callback_refs.append(submit)
-    from kt_kernel import kt_kernel_ext
-    kt_kernel_ext.launch_no_block_callback(
-        ctypes.cast(submit, ctypes.c_void_p).value, 0, args[1])

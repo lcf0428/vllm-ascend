@@ -319,3 +319,90 @@ class LRCExpertCachePolicy:
     def _victim_key(self, layer_idx: int, expert_id: int) -> tuple[float, int, int]:
         state = self.layer_states[layer_idx]
         return (self.hotness(layer_idx, expert_id), state.last_used[expert_id], expert_id)
+
+
+# Adapted from haodi19/vllm-ascend, dev/moeoffload-worker-poll (268b963c).
+class CppLRCExpertCachePolicy:
+    """Optional CPU C++ backend. Native state persists across calls.
+
+    ``layer_states`` provides diagnostic snapshots, not mutable live state.
+    Use the public policy methods to update state. The original Python class
+    remains unchanged. Bindings retain the GIL to serialize state access.
+    """
+
+    def __init__(self, **kwargs):
+        # Lazy import: the default Python backend needs no compiler/extension.
+        try:
+            import _vllm_ascend_lrc as native
+        except ImportError as exc:
+            raise ImportError(
+                "C++ LRC requested but its extension is unavailable. Build with: "
+                "python -m pip install ./csrc/lrc_policy --no-build-isolation --no-deps; "
+                "C++ LRC is required when host hybrid admission uses the cache policy"
+            ) from exc
+        if native.api_version not in (1, 2, 3):
+            raise RuntimeError("C++ LRC API mismatch; rebuild ./csrc/lrc_policy")
+        reference = LRCExpertCachePolicy(**kwargs)
+        self.__dict__.update({key: value for key, value in vars(reference).items() if key != "layer_states"})
+        # NumPy 1 and 2 differ in Python scalar / np.float32 promotion.
+        scalar_f32 = np.asarray(1.0 * np.float32(1)).dtype == np.float32
+        self._native = native.Policy(
+            len(reference.layer_states), self.num_experts, self.recent_window,
+            self.ema_beta, self.recent_weight, self.ema_weight,
+            self.router_weight, self.age_weight, scalar_f32,
+        )
+
+    @property
+    def layer_states(self):
+        result = []
+        for index in range(self._native.num_layers()):
+            values = self._native.snapshot(index)
+            values["ema"] = np.asarray(values["ema"], dtype=np.float32)
+            values["recent_queue"] = deque(tuple(tuple(pair) for pair in row)
+                                           for row in values["recent_queue"])
+            result.append(LRCLayerState(**values))
+        return result
+
+    def add_layer(self):
+        return self._native.add_layer()
+
+    def observe(self, layer_idx, topk_ids, router_scores=None):
+        return self._native.observe(layer_idx, topk_ids, router_scores)
+
+    def observe_global_counts(self, layer_idx, global_counts, global_router_score=None):
+        counts = np.asarray(global_counts, dtype=np.int64)
+        if counts.ndim != 1 or counts.size != self.num_experts:
+            raise ValueError(f"global_counts must have shape ({self.num_experts},)")
+        scores = None
+        if global_router_score is not None:
+            scores = np.asarray(global_router_score, dtype=np.float32)
+            if scores.shape != counts.shape:
+                raise ValueError("global_router_score must have shape matching global_counts")
+        return self._native.observe_global(layer_idx, counts, scores)
+
+    def choose_victims(self, layer_idx, slot_owner, protected, count):
+        return self._native.choose(layer_idx, list(slot_owner.values()), protected, count)
+
+    def choose_victim(self, layer_idx, slot_owner, protected, loading=None):
+        result = self.choose_victims(layer_idx, slot_owner, protected | (loading or set()), 1)
+        if not result:
+            result = self.choose_victims(layer_idx, slot_owner, protected, 1)
+        return result[0] if result else None
+
+    def hotness(self, layer_idx, expert_id):
+        return self._native.hotness(layer_idx, expert_id)
+
+    def hotness_array(self, layer_idx):
+        return np.asarray(self._native.hotness_array(layer_idx), dtype=np.float32)
+
+    def seed_layer_hotness(self, layer_idx, weights):
+        if not weights:
+            return
+        maximum = max(weights.values()) or 1.0
+        for eid, weight in weights.items():
+            norm = weight / maximum if maximum > 0 else 0.0
+            # Preserve Python's ties-to-even round for cold-start seeding.
+            self._native.seed(layer_idx, eid, max(1, round(norm * self.recent_window)), float(weight))
+
+    def layer_step(self, layer_idx):
+        return self._native.step(layer_idx)
