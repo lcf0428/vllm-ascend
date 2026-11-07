@@ -344,6 +344,55 @@ class ExclusivePoolTests(unittest.TestCase):
                         copy(target, source, shard, "w13_weight_scale")
                 np.testing.assert_array_equal(target.data, expected)
 
+    def test_mxfp4_finalization_preserves_already_nz_slots_without_native_cpu(self):
+        # The DeepSeek loader already produced NZ. Touching .data would start
+        # the erroneous transpose/contiguous/recast sequence from the report.
+        class AlreadyNZ:
+            @property
+            def data(self):
+                raise AssertionError("Already-NZ storage must be preserved verbatim")
+
+        layer = SimpleNamespace(w13_weight=AlreadyNZ(), w2_weight=AlreadyNZ())
+        npu = SimpleNamespace(get_npu_format=Mock(return_value=29), npu_format_cast=Mock())
+        manager = SimpleNamespace(moe_layers=[layer], native_mxfp4_enabled=False,
+                                  offload_config=SimpleNamespace(exclusive_expert_storage=True))
+        convert = method("_cast_device_slots_to_mxfp4_nz", torch_npu=npu, _expert_weight=getattr)
+        for _ in range(2):
+            convert(manager)
+        self.assertEqual(npu.get_npu_format.call_count, 4)
+        npu.npu_format_cast.assert_not_called()
+
+    def test_mxfp4_mixed_layout_converts_only_base_format_weight(self):
+        nz, base, converted = Mock(), Mock(), Mock()
+        npu = SimpleNamespace(get_npu_format=lambda w: 29 if w is nz else 2,
+                              npu_format_cast=Mock(return_value=converted), float4_e2m1fn_x2="fp4")
+        layer = SimpleNamespace(w13_weight=nz, w2_weight=base)
+        manager = SimpleNamespace(moe_layers=[layer], native_mxfp4_enabled=False,
+                                  offload_config=SimpleNamespace(exclusive_expert_storage=True))
+        convert = method("_cast_device_slots_to_mxfp4_nz", torch_npu=npu, _expert_weight=getattr,
+                         torch=SimpleNamespace(uint8="uint8", float8_e4m3fn="fp8"))
+        original_nz_data = nz.data
+        convert(manager)
+        npu.npu_format_cast.assert_called_once()
+        self.assertIs(nz.data, original_nz_data)
+        self.assertIs(base.data, converted.transpose.return_value)
+        converted.transpose.assert_called_once_with(1, 2)
+
+    def test_mxfp4_base_format_failure_is_not_silently_ignored(self):
+        base = Mock(shape=(2, 32, 16), dtype="uint8")
+        original = base.data
+        npu = SimpleNamespace(get_npu_format=Mock(return_value=2),
+                              npu_format_cast=Mock(side_effect=RuntimeError("ACL 361001")),
+                              float4_e2m1fn_x2="fp4")
+        manager = SimpleNamespace(moe_layers=[SimpleNamespace(w13_weight=base)],
+                                  offload_config=SimpleNamespace(exclusive_expert_storage=True))
+        convert = method("_cast_device_slots_to_mxfp4_nz", torch_npu=npu, _expert_weight=getattr,
+                         torch=SimpleNamespace(uint8="uint8", float8_e4m3fn="fp8"))
+        with self.assertRaisesRegex(RuntimeError, "weight=w13_weight, source_format=2") as error:
+            convert(manager)
+        self.assertEqual(str(error.exception.__cause__), "ACL 361001")
+        self.assertIs(base.data, original)
+
 
 if __name__ == "__main__":
     unittest.main()

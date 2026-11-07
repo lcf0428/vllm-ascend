@@ -1346,8 +1346,9 @@ class ExpertOffloadManager:
     def _cast_device_slots_to_mxfp4_nz(self):
         """Stamp on-device W4A8_MXFP expert weight slots with format-29 (NZ).
 
-        The device slot is already transposed by process_weights (offload
-        branch). Mirror the non-offload cast-then-transpose — and the CPU
+        Some quantization loaders already cast and transpose resident slots;
+        preserve those NZ allocations verbatim. For base-format slots already
+        transposed by process_weights, mirror the cast-then-transpose and CPU
         relayout in _cast_cpu_weights_to_device_format — by transposing back
         to the original shape, casting 29, then transposing forward again, so
         the slot's format-29 layout is transpose(cast(original)). That is the
@@ -1374,7 +1375,13 @@ class ExpertOffloadManager:
                 w = _expert_weight(layer, name)
                 if w is None:
                     continue
-                if self.native_mxfp4_enabled and torch_npu.get_npu_format(w) == 29:
+                source_format = torch_npu.get_npu_format(w)
+                if source_format == 29:
+                    # DeepSeek MXFP4 loaders also produce NZ before manager
+                    # finalization, not only the native CPU backend. Recasting
+                    # their packed storage is unnecessary and may fail with
+                    # aclnnNpuFormatCast error 361001. Keep bytes, strides and
+                    # the original device allocation unchanged.
                     continue
                 d = w.data.transpose(1, 2).contiguous()
                 try:
@@ -1389,7 +1396,11 @@ class ExpertOffloadManager:
                         # There is no Host backup to refill these resident
                         # slots with NZ bytes. The legacy metadata-only
                         # fallback is therefore not safe in exclusive mode.
-                        raise RuntimeError("Exclusive resident MXFP4 format conversion failed") from e
+                        raise RuntimeError(
+                            "Exclusive resident MXFP4 format conversion failed: "
+                            f"weight={name}, source_format={source_format}, "
+                            f"shape={tuple(w.shape)}, dtype={w.dtype}"
+                        ) from e
                     logger.warning(
                         "[OFFLOAD] npu_format_cast to format-29 (mxfp4 NZ) "
                         "failed on layer slot %r; leaving expert slots in base "
