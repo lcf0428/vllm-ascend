@@ -1965,6 +1965,9 @@ class ExpertOffloadConfig:
 
     _defaults = {
         "expert_offload": False,
+        # Single-card Host/device exclusive ownership; one Host exchange
+        # bundle per distinct expert layout, shared across layers.
+        "exclusive_expert_storage": False,
         "num_device_experts": 32,
         "num_device_layers": 2,
         "expert_map_path": None,
@@ -2036,6 +2039,23 @@ class ExpertOffloadConfig:
                     raise ValueError(f"Config has no attribute '{key}'")
 
         self.cpu_moe = CpuMoeConfig(user_config.get("cpu_moe"))
+        exclusive = self.config["exclusive_expert_storage"]
+        if not isinstance(exclusive, bool):
+            raise TypeError("exclusive_expert_storage must be a boolean")
+        if exclusive:
+            if not self.config["expert_offload"]:
+                raise ValueError("exclusive_expert_storage requires expert_offload=True")
+            if self.cpu_moe.enabled:
+                raise ValueError("exclusive_expert_storage does not support cpu_moe")
+            if self.config["enable_multi_card"] or self.config["expert_prefetch_enabled"]:
+                raise ValueError("exclusive_expert_storage requires single-card execution without expert prefetch")
+            if self.config["h2d_backend"] != "torch":
+                raise ValueError("exclusive_expert_storage currently requires h2d_backend='torch'")
+            if self.config["prefill_split_gmm"]:
+                raise ValueError("exclusive_expert_storage retains the full Prefill pool; disable prefill_split_gmm")
+            # A resident expert no longer has a Host source. Prefill must
+            # obtain it by D2D from the fixed decode slots.
+            self.config["prefill_delta_load"] = True
         if self.cpu_moe.enabled and not self.config["expert_offload"]:
             raise ValueError("cpu_moe requires expert_offload=True")
         self._validate_config()
