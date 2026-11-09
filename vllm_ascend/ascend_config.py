@@ -1968,6 +1968,10 @@ class ExpertOffloadConfig:
         # Single-card Host/device exclusive ownership; one Host exchange
         # bundle per distinct expert layout, shared across layers.
         "exclusive_expert_storage": False,
+        # Optional startup-only CPU staging arena for parallel Host copies.
+        # Size is in MiB; the arena is released before NZ conversion/capture.
+        "exclusive_load_pool_enabled": False,
+        "exclusive_load_pool_size_mb": 1024,
         "num_device_experts": 32,
         "num_device_layers": 2,
         "expert_map_path": None,
@@ -2042,6 +2046,16 @@ class ExpertOffloadConfig:
         exclusive = self.config["exclusive_expert_storage"]
         if not isinstance(exclusive, bool):
             raise TypeError("exclusive_expert_storage must be a boolean")
+        load_pool = self.config["exclusive_load_pool_enabled"]
+        if not isinstance(load_pool, bool):
+            raise TypeError("exclusive_load_pool_enabled must be a boolean")
+        load_pool_mb = self.config["exclusive_load_pool_size_mb"]
+        if type(load_pool_mb) is not int:
+            raise TypeError("exclusive_load_pool_size_mb must be an integer (MiB)")
+        if load_pool_mb <= 0:
+            raise ValueError("exclusive_load_pool_size_mb must be positive")
+        if load_pool and not exclusive:
+            raise ValueError("exclusive_load_pool_enabled requires exclusive_expert_storage=True")
         if exclusive:
             if not self.config["expert_offload"]:
                 raise ValueError("exclusive_expert_storage requires expert_offload=True")

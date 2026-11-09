@@ -38,7 +38,7 @@ the current Host owner; cached descriptors never retain old expert addresses.
 Startup places experts directly: initial resident experts [0,K) go through the
 original NPU weight loader and receive no Host weight or quantization buffers.
 Only the remaining E-K experts allocate pinned Host buffers. Checkpoint copies
-are synchronous in this mode, avoiding queued owned clones; gate/up scale
+are synchronous by default, avoiding queued owned clones; gate/up scale
 shards write directly into their final slices instead of retaining first-shard
 copies. Host weight format conversion runs one expert at a time, so it never
 stacks a complete layer on CPU or NPU. Scale/bias conversion replaces each
@@ -52,6 +52,65 @@ Host checkpoint duplicate and full-layer weight-conversion temporary. It does
 not bound the upstream checkpoint loader's input tensors/page cache, NPU
 allocator reservations, other model components, or the complete Prefill pool.
 Measure RSS and NPU peak allocations separately on the serving machine.
+
+## Optional parallel checkpoint loading
+
+To overlap checkpoint iteration with parallel transpose/copies into the final
+Host buffers, add these fields to `expert_offload_config`:
+
+```json
+{
+  "exclusive_expert_storage": true,
+  "exclusive_load_pool_enabled": true,
+  "exclusive_load_pool_size_mb": 1024
+}
+```
+
+`exclusive_load_pool_enabled` defaults to `false`. When enabled it requires
+exclusive storage. `exclusive_load_pool_size_mb` is a positive integer in MiB
+(1 MiB = 1,048,576 bytes), default 1024. It limits one shared, startup-only CPU
+staging arena across all layers, not a per-layer allocation. The arena is
+ordinary CPU memory; the final expert Host buffers remain pinned.
+
+The first eligible nonresident shard lazily allocates the configured arena.
+The loader copies checkpoint data synchronously into a leased arena range,
+then returns while one of the existing 32 workers writes the final Host
+destination. Ranges are aligned to 64 bytes and reused only after the writer
+completes. Worker tasks do not retain checkpoint tensors or mmap views. This
+also applies to gate/up scale shards, which write disjoint final slices.
+Resident experts bypass Host staging entirely.
+
+If the arena is full or fragmented, the producer waits for completed writers
+and coalesces free ranges. At most 128 tasks are pending. A single shard too
+large for the configured arena is copied synchronously after prior writers
+finish, without allocating an oversized temporary. Thus a very small pool
+can reduce parallelism or cause synchronous fallbacks.
+
+Loading finalization waits for all writes, propagates worker errors, releases
+the arena, and restores torch intra-op threads before NZ conversion, Prefill
+pool initialization, and graph capture. The runtime exchange spare pool is
+separate and unchanged. This option accelerates checkpoint-to-Host loading;
+it does not batch or parallelize the later per-expert NZ conversion.
+
+`[EXCLUSIVE-LOAD]` logs report capacity, peak leased bytes, staged/fallback
+shard counts and backpressure wait time. The arena allocation equals its
+configured capacity once created; peak leased bytes are not total RSS. The
+budget excludes checkpoint mappings/page cache, final Host/NPU weights,
+thread stacks, packing/scale-operation temporaries, allocator retention and
+Prefill storage. Synchronous loading now also records Host load-phase wall
+time rather than reporting zero.
+
+On the serving machine, compare both modes with the same checkpoint and
+thread settings, including the final drain and NZ-conversion phases. A CPU
+transpose-copy microbenchmark (no checkpoint or model required) is available:
+
+```bash
+python benchmarks/benchmark_exclusive_load_pool.py --pool-size-mb 1024
+```
+
+It checks copied values and reports synchronous/pooled wall time including
+drain, copy throughput, and peak staging leases. It excludes SSD I/O and NZ
+conversion, so full-model startup timing and RSS still need separate checks.
 
 ## Prefill and graph execution
 
@@ -77,6 +136,7 @@ Dependency-free orchestration tests:
 
 ```bash
 python tests/ut/expert_offload/test_exclusive_pool.py -v
+python tests/ut/expert_offload/test_load_buffer_pool.py -v
 ```
 
 Small NPU startup regression without loading a checkpoint. It checks that
@@ -92,6 +152,7 @@ Hardware tests also cover eager and graph-replayed swaps, including quant metada
 
 ```bash
 pytest -v tests/e2e/nightly/single_node/ops/singlecard_ops/test_exclusive_expert_graph.py
+pytest -v tests/e2e/nightly/single_node/ops/singlecard_ops/test_exclusive_load_pool.py
 ```
 
 Before deployment, compare the same quantized model with the option disabled

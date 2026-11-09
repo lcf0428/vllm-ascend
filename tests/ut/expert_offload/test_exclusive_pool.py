@@ -5,11 +5,13 @@ importing vLLM/torch_npu. This checks orchestration, not accelerator kernels.
 """
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from enum import Enum
 import importlib.util
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -21,6 +23,10 @@ spec = importlib.util.spec_from_file_location("exclusive_pool", SOURCE / "exclus
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 ExclusiveExpertPool = module.ExclusiveExpertPool
+load_spec = importlib.util.spec_from_file_location("load_buffer_pool", SOURCE / "load_buffer_pool.py")
+load_module = importlib.util.module_from_spec(load_spec)
+load_spec.loader.exec_module(load_module)
+LoadBufferPool = load_module.LoadBufferPool
 
 
 def method(name, **namespace):
@@ -192,6 +198,8 @@ class ExclusivePoolTests(unittest.TestCase):
         config_type = namespace["ExpertOffloadConfig"]
         config_type._validate_config = lambda self: None
         self.assertFalse(config_type({}).exclusive_expert_storage)
+        self.assertFalse(config_type({}).exclusive_load_pool_enabled)
+        self.assertEqual(config_type({}).exclusive_load_pool_size_mb, 1024)
         valid = {"expert_offload": True, "exclusive_expert_storage": True}
         self.assertTrue(config_type(valid).prefill_delta_load)
         for invalid in ({"cpu_moe": {"enabled": True}}, {"enable_multi_card": True},
@@ -201,6 +209,18 @@ class ExclusivePoolTests(unittest.TestCase):
                 config_type(valid | invalid)
         with self.assertRaises(TypeError):
             config_type(valid | {"exclusive_expert_storage": "true"})
+        pool_config = config_type(valid | {"exclusive_load_pool_enabled": True, "exclusive_load_pool_size_mb": 64})
+        self.assertEqual(pool_config.exclusive_load_pool_size_mb, 64)
+        with self.assertRaises(ValueError):
+            config_type({"expert_offload": True, "exclusive_load_pool_enabled": True})
+        with self.assertRaises(TypeError):
+            config_type(valid | {"exclusive_load_pool_enabled": "true"})
+        for size in (True, "1024", 1.5, None):
+            with self.subTest(size=size), self.assertRaises(TypeError):
+                config_type(valid | {"exclusive_load_pool_size_mb": size})
+        for size in (0, -1):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                config_type(valid | {"exclusive_load_pool_size_mb": size})
 
     def test_host_source_tracks_rotating_owner(self):
         manager = SimpleNamespace(_exclusive_pool=self.pool)
@@ -267,14 +287,19 @@ class ExclusivePoolTests(unittest.TestCase):
     def test_cold_weight_loader_is_synchronous_without_owned_clones(self):
         destination = SimpleNamespace(shape=(4, 4))
         manager = SimpleNamespace(_weight_load_calls=0, native_mxfp4_enabled=False,
-                                  offload_config=SimpleNamespace(exclusive_expert_storage=True),
+                                  offload_config=SimpleNamespace(exclusive_expert_storage=True,
+                                                                exclusive_load_pool_enabled=False),
+                                  _load_phase_start=0.0,
                                   _shard_local=lambda eid: eid, w13_weights_cpu=[[destination]],
                                   w2_weights_cpu=[[destination]], _copy_w13_shard=Mock(), _copy_w2=Mock())
+        copy = method("_copy_exclusive_loaded_shard", time=time)
+        manager._copy_exclusive_loaded_shard = lambda *args: copy(manager, *args)
         source = SimpleNamespace(ndim=2, shape=(2, 4))  # No cpu()/clone() methods.
         method("load_w13")(manager, 0, 0, source, "w3")
         method("load_w2")(manager, 0, 0, source)
         manager._copy_w13_shard.assert_called_once_with(destination, source, "w3", 2)
         manager._copy_w2.assert_called_once_with(destination, source)
+        self.assertGreater(manager._load_phase_start, 0)
 
     def test_prefill_initialization_does_not_require_complete_host_weights(self):
         transport = Mock()
@@ -421,6 +446,152 @@ class ExclusivePoolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, f"source_format={source_format}"):
                     convert(manager)
                 npu.npu_format_cast.assert_called_once()
+
+
+class ExclusiveLoadPoolTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("Optional NumPy needed for loader tensor adapters")
+        self.np = np
+
+        class Tensor:
+            def __init__(self, data):
+                self.data = data
+                self.shape, self.dtype, self.ndim = data.shape, data.dtype, data.ndim
+
+            def numel(self):
+                return self.data.size
+
+            def element_size(self):
+                return self.data.itemsize
+
+            def narrow(self, dim, offset, size):
+                slices = [slice(None)] * self.ndim
+                slices[dim] = slice(offset, offset + size)
+                return Tensor(self.data[tuple(slices)])
+
+            def view(self, dtype):
+                return Tensor(self.data.view(dtype))
+
+            def reshape(self, *shape):
+                return Tensor(self.data.reshape(*shape))
+
+            def t(self):
+                return Tensor(self.data.T)
+
+            def __getitem__(self, index):
+                return Tensor(self.data[index])
+
+            def copy_(self, source):
+                self.data[...] = source.data
+
+        self.Tensor = Tensor
+        self.threads = [16]
+        self.torch = SimpleNamespace(
+            uint8=np.uint8, get_num_threads=lambda: self.threads[-1], set_num_threads=self.threads.append,
+            empty=Mock(side_effect=lambda size, dtype, device: Tensor(np.empty(size, dtype=dtype))))
+
+    def manager(self, enabled):
+        manager = SimpleNamespace(
+            offload_config=SimpleNamespace(exclusive_expert_storage=True, exclusive_load_pool_enabled=enabled,
+                                          exclusive_load_pool_size_mb=1),
+            _load_pool=None, _exclusive_load_pool=None, _load_phase_start=0.0, _saved_num_threads=None,
+            _LOAD_POOL_WORKERS=2, _LOAD_POOL_DRAIN_EVERY=128, _load_futures=[],
+            _weight_load_calls=0, _weight_load_secs=0.0, native_mxfp4_enabled=False,
+            _shard_local=lambda eid: eid,
+        )
+        namespace = dict(torch=self.torch, time=time, logger=Mock(),
+                         LoadBufferPool=LoadBufferPool, ThreadPoolExecutor=ThreadPoolExecutor)
+        for name in ("_get_load_pool", "_copy_exclusive_loaded_shard", "_drain_futures", "drain_load_pool",
+                     "load_w13", "load_w2", "_load_scale_shard"):
+            function = method(name, **namespace)
+            setattr(manager, name, lambda *args, fn=function: fn(manager, *args))
+        for name in ("_copy_w13_shard", "_copy_w2", "_copy_exclusive_scale_shard"):
+            setattr(manager, name, method(name, **namespace))
+        self.addCleanup(manager.drain_load_pool)
+        return manager
+
+    def test_enabled_and_disabled_loaders_produce_identical_weights_and_scales(self):
+        np, Tensor = self.np, self.Tensor
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                manager = self.manager(enabled)
+                w13 = Tensor(np.zeros((4, 6), dtype=np.uint8))
+                w2 = Tensor(np.zeros((3, 4), dtype=np.uint8))
+                scales = Tensor(np.zeros(6, dtype=np.float32))
+                manager.w13_weights_cpu = [[None, w13]]
+                manager.w2_weights_cpu = [[None, w2]]
+                manager.scale_cpu_buffers = {"w13_weight_scale": [[None, scales]]}
+                # Resident sources must not even be inspected or start a pool.
+                for shard in ("w1", "w3"):
+                    manager.load_w13(0, 0, object(), shard)
+                    manager._load_scale_shard(0, 0, "w13_weight_scale", shard, object())
+                manager.load_w2(0, 0, object())
+                self.assertIsNone(manager._load_pool)
+                expected = []
+                for shard in ("w3", "w1"):
+                    data = np.arange(12, dtype=np.uint8).reshape(3, 4) + (20 if shard == "w3" else 0)
+                    expected.append(data.T.copy())
+                    manager.load_w13(0, 1, Tensor(data), shard)
+                    data.fill(255)  # Loader source lifetime ends at return.
+                    scale = np.arange(3, dtype=np.float32) + (10 if shard == "w3" else 0)
+                    manager._load_scale_shard(0, 1, "w13_weight_scale", shard, Tensor(scale))
+                    scale.fill(255)
+                data = np.arange(12, dtype=np.uint8).reshape(4, 3)
+                manager.load_w2(0, 1, Tensor(data))
+                data.fill(255)
+                pool = manager._exclusive_load_pool
+                manager.drain_load_pool()
+                np.testing.assert_array_equal(w13.data, np.concatenate(expected[::-1], axis=1))
+                np.testing.assert_array_equal(w2.data, np.arange(12, dtype=np.uint8).reshape(4, 3).T)
+                np.testing.assert_array_equal(scales.data, [0, 1, 2, 10, 11, 12])
+                self.assertGreater(manager._weight_load_secs, 0)
+                self.assertIsNone(manager._exclusive_load_pool)
+                self.assertIsNone(manager._load_pool)
+                if enabled:
+                    self.assertEqual(pool.submitted, 5)
+                    self.assertIsNone(pool.storage)
+                    self.torch.empty.assert_called_once_with(1024 * 1024, dtype=np.uint8, device="cpu")
+                    self.assertEqual(self.threads, [16, 1, 16])
+                else:
+                    self.torch.empty.assert_not_called()
+                    self.assertEqual(self.threads, [16])
+
+    def test_worker_failure_drains_pool_and_restores_torch_threads(self):
+        manager = self.manager(True)
+        source = self.Tensor(self.np.zeros(16, dtype=self.np.uint8))
+        manager._copy_exclusive_loaded_shard(object(), source, Mock(side_effect=RuntimeError("copy failed")))
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            manager.drain_load_pool()
+        self.assertIsNone(manager._exclusive_load_pool)
+        self.assertIsNone(manager._load_pool)
+        self.assertEqual(self.threads, [16, 1, 16])
+
+    def test_oversized_shard_copies_synchronously_without_arena(self):
+        manager = self.manager(True)
+        source = self.Tensor(self.np.zeros(1024 * 1024 + 1, dtype=self.np.uint8))
+        copy = Mock()
+        target = object()
+        manager._copy_exclusive_loaded_shard(target, source, copy)
+        copy.assert_called_once_with(target, source)
+        self.torch.empty.assert_not_called()
+        self.assertEqual(manager._exclusive_load_pool.synchronous, 1)
+        manager.drain_load_pool()
+        self.assertEqual(self.threads, [16, 1, 16])
+
+    def test_staging_failure_releases_arena_and_restores_threads(self):
+        manager = self.manager(True)
+        source = self.Tensor(self.np.zeros(16, dtype=self.np.uint8))
+        copy = Mock()
+        with patch.object(self.Tensor, "copy_", side_effect=RuntimeError("staging failed")):
+            with self.assertRaisesRegex(RuntimeError, "staging failed"):
+                manager._copy_exclusive_loaded_shard(object(), source, copy)
+        copy.assert_not_called()
+        self.assertIsNone(manager._exclusive_load_pool)
+        self.assertIsNone(manager._load_pool)
+        self.assertEqual(self.threads, [16, 1, 16])
 
 
 if __name__ == "__main__":

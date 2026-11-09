@@ -29,6 +29,7 @@ from vllm_ascend.expert_offload.h2d_transfer import (
     TorchCopyH2DTransport,
     create_h2d_transport,
 )
+from vllm_ascend.expert_offload.load_buffer_pool import LoadBufferPool
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.expert_offload.native_mxfp4_h2d import NativeExpertUploadTask, NativeMXFP4H2DTransport
 from vllm_ascend.ops.fused_moe.experts_selector import (
@@ -255,8 +256,8 @@ class ExpertOffloadManager:
         self._mc_debug_active_callbacks = 0
         self._mc_debug_layer_calls: dict[tuple[int, bool], int] = {}
 
-        # Diagnostic: wall time of the parallel weight-load phase (safetensors
-        # → pinned CPU buffers). Logged in _finalize_offload.
+        # Diagnostic: wall time of the Host weight-load phase (safetensors
+        # → pinned CPU buffers), including synchronous exclusive loading.
         self._weight_load_secs: float = 0.0
         self._weight_load_calls: int = 0
 
@@ -268,6 +269,7 @@ class ExpertOffloadManager:
         # drain_load_pool() is called from _finalize_offload before the buffers
         # are read by process_weights_after_loading().
         self._load_pool: ThreadPoolExecutor | None = None
+        self._exclusive_load_pool: LoadBufferPool | None = None
         self._load_futures: list = []
         self._load_phase_start: float = 0.0
         self._saved_num_threads: int | None = None
@@ -1501,9 +1503,44 @@ class ExpertOffloadManager:
             self._saved_num_threads = torch.get_num_threads()
             torch.set_num_threads(1)
             self._load_pool = ThreadPoolExecutor(max_workers=self._LOAD_POOL_WORKERS, thread_name_prefix="offload-load")
-            self._load_phase_start = time.perf_counter()
+            if not self._load_phase_start:
+                self._load_phase_start = time.perf_counter()
             logger.info("[OFFLOAD] starting parallel weight load (workers=%d)", self._LOAD_POOL_WORKERS)
         return self._load_pool
+
+    def _copy_exclusive_loaded_shard(self, target, loaded, copy_fn, *args):
+        """Own checkpoint input in a bounded arena, or copy synchronously."""
+        if not self._load_phase_start:
+            self._load_phase_start = time.perf_counter()
+        try:
+            if self.offload_config.exclusive_load_pool_enabled:
+                if self._exclusive_load_pool is None:
+                    capacity = self.offload_config.exclusive_load_pool_size_mb * 1024 * 1024
+                    self._exclusive_load_pool = LoadBufferPool(
+                        capacity,
+                        self._get_load_pool(),
+                        lambda size: torch.empty(size, dtype=torch.uint8, device="cpu"),
+                        max_pending=self._LOAD_POOL_DRAIN_EVERY,
+                    )
+                    logger.info(
+                        "[EXCLUSIVE-LOAD] staging enabled: capacity_bytes=%d workers=%d",
+                        capacity, self._LOAD_POOL_WORKERS,
+                    )
+                nbytes = loaded.numel() * loaded.element_size()
+                shape, dtype = tuple(loaded.shape), loaded.dtype
+                if self._exclusive_load_pool.submit(
+                    nbytes,
+                    lambda storage, offset: storage.narrow(0, offset, nbytes).view(dtype).reshape(shape),
+                    lambda staging: staging.copy_(loaded),
+                    lambda staging: copy_fn(target, staging, *args),
+                ):
+                    return
+            copy_fn(target, loaded, *args)
+        except BaseException:
+            # A failed copy/worker must not leave writers running or torch
+            # intra-op threads changed while startup unwinds.
+            self.drain_load_pool()
+            raise
 
     def _track_load_future(self, fut) -> None:
         self._load_futures.append(fut)
@@ -1537,16 +1574,32 @@ class ExpertOffloadManager:
         """Wait for all deferred weight copies to finish.
 
         Safe to call after the safetensors mmap is unmapped: deferred copies
-        read owned clones, not mmap views.
+        read owned clones or arena views, not checkpoint mmap views.
         """
-        self._drain_futures()
-        if self._load_pool is not None:
-            self._load_pool.shutdown(wait=True)
-            self._load_pool = None
+        try:
+            if self._exclusive_load_pool is not None:
+                pool = self._exclusive_load_pool
+                try:
+                    pool.close()
+                finally:
+                    logger.info(
+                        "[EXCLUSIVE-LOAD] capacity_bytes=%d peak_in_use_bytes=%d "
+                        "staged_shards=%d synchronous_shards=%d backpressure_wait=%.2fs",
+                        pool.capacity_bytes, pool.peak_in_use_bytes,
+                        pool.submitted, pool.synchronous, pool.wait_seconds,
+                    )
+                    self._exclusive_load_pool = None
+            self._drain_futures()
+        finally:
+            if self._load_pool is not None:
+                self._load_pool.shutdown(wait=True)
+                self._load_pool = None
             if self._saved_num_threads is not None:
                 torch.set_num_threads(self._saved_num_threads)
                 self._saved_num_threads = None
-            self._weight_load_secs = time.perf_counter() - self._load_phase_start
+            if self._load_phase_start:
+                self._weight_load_secs = time.perf_counter() - self._load_phase_start
+                self._load_phase_start = 0.0
 
     # -- int4 packing helper for W4A8_DYNAMIC checkpoints -- #
 
@@ -1685,7 +1738,7 @@ class ExpertOffloadManager:
             else:
                 loaded_weight = loaded_weight.narrow(0, 0, intermed)
         if self.offload_config.exclusive_expert_storage:
-            self._copy_w13_shard(cpu, loaded_weight, shard_id, intermed)
+            self._copy_exclusive_loaded_shard(cpu, loaded_weight, self._copy_w13_shard, shard_id, intermed)
             return
         owned = loaded_weight.cpu().clone()
         fut = self._get_load_pool().submit(self._copy_w13_shard, cpu, owned, shard_id, intermed)
@@ -1704,7 +1757,7 @@ class ExpertOffloadManager:
         if dst is None:
             return
         if self.offload_config.exclusive_expert_storage:
-            self._copy_w2(dst, loaded_weight)
+            self._copy_exclusive_loaded_shard(dst, loaded_weight, self._copy_w2)
             return
         owned = loaded_weight.cpu().clone()
         fut = self._get_load_pool().submit(self._copy_w2, dst, owned)
@@ -1746,7 +1799,9 @@ class ExpertOffloadManager:
         if target is None:
             return
         if self.offload_config.exclusive_expert_storage:
-            self._copy_exclusive_scale_shard(target, loaded_weight, shard_id, attr_name)
+            self._copy_exclusive_loaded_shard(
+                target, loaded_weight, self._copy_exclusive_scale_shard, shard_id, attr_name
+            )
             return
         if attr_name.startswith("w13_"):
             key = (layer_moe_idx, expert_id, attr_name)
