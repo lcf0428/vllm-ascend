@@ -28,8 +28,6 @@ from vllm.model_executor.layers.fused_moe import FusedMoERouter, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 from vllm.model_executor.utils import replace_parameter
-
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -43,6 +41,8 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedEx
 from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
+
+from vllm_ascend.ascend_config import get_ascend_config
 
 
 def _prepare_expert_offload_before_super(layer_name, moe_config, quant_config, expert_map_manager):
@@ -472,12 +472,13 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         cfg = get_ascend_config().expert_offload_config
         if not cfg.expert_offload:
             return
-        from vllm_ascend.expert_offload import ExpertOffloadManager
         from vllm_ascend.expert_offload.utils import (
             init_expert_offload_config,
             init_log2phy_for_offload,
             init_log2phy_for_offload_multi_card,
         )
+
+        from vllm_ascend.expert_offload import ExpertOffloadManager
 
         cfg = get_ascend_config().expert_offload_config
         self.enable_expert_offload = False
@@ -526,10 +527,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             global_num_experts=self.moe_config.num_experts,
         )
         mgr.init_layer_cpu_buffers(self, self.offload_layer_idx)
-        from vllm_ascend.expert_offload.cpu_backend.wiring import maybe_attach_cpu_expert_backend
+        from vllm_ascend.expert_offload.cpu_backend.wiring import attach_or_defer_cpu_expert_backend
 
         if not mgr.native_mxfp4_enabled:
-            maybe_attach_cpu_expert_backend(
+            attach_or_defer_cpu_expert_backend(
+                mgr,
                 routed_experts=self,
                 layer_name=self.layer_name,
                 moe_config=self.moe_config,

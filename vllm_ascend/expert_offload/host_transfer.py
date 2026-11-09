@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import queue
 import threading
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 import torch
 import torch_npu
 
+from .dma_submit_timing import stamp
 from .host_transfer_policy import HostTransferPolicy
 
 _LOG = logging.getLogger(__name__)
@@ -23,6 +25,7 @@ class WeightRequest:
     mapping_device: object
     loads: tuple
     ready: object
+    timing: object = None
 
 
 class HostWeightWorker:
@@ -52,17 +55,33 @@ class HostWeightWorker:
 
     def _process(self, request):
         transfer = request.transfer
+        timing = getattr(request, 'timing', None)
+        stamp(timing, 'process_enter')
         with torch.npu.stream(self.stream):
-            self.manager._load_expert_weights_into_slots(transfer.layer, transfer.layer_idx, request.loads)
+            stamp(timing, 'stream_enter')
+            if timing is None:
+                self.manager._load_expert_weights_into_slots(transfer.layer, transfer.layer_idx, request.loads)
+            else:
+                self.manager._load_expert_weights_into_slots(
+                    transfer.layer, transfer.layer_idx, request.loads, timing=timing
+                )
             request.mapping_device.copy_(request.mapping_host, non_blocking=True)
+            stamp(timing, 'mapping_return')
             # Record on DMA itself after weights, quant attributes and mapping.
             # Never use the independent CPU-output completion stream here.
             request.ready.record(self.stream)
+            stamp(timing, 'ready_record_return')
 
     @torch.inference_mode()
     def _run(self):
         try:
             torch.npu.set_device(self.device)
+            cpu = getattr(getattr(self.manager, "offload_config", None), "cpu_moe", None)
+            if getattr(cpu, "native_dispatch", False):
+                core = cpu.native_dispatch_dma_cpu
+                os.sched_setaffinity(
+                    0, {core if core is not None else int(os.environ.get("KT_MOE_COMPLETION_CPU", "7"))}
+                )
             while True:
                 request = self.jobs.get()
                 if request is None:
@@ -113,6 +132,12 @@ class HostTransferContext:
         transfer = self.transfer
         transfer.worker.raise_if_failed()
         ids, weights = transfer.backend._pinned_route_buffers(self.hidden)
+        if getattr(transfer, "native_planner", None) is not None:
+            loads = transfer.native_planner.prepare(
+                ids.data_ptr(), weights.data_ptr(), self.mapping.data_ptr(),
+                ids.shape[0], ids.shape[1], ids.element_size(), self.mapping.element_size())
+            transfer.worker.submit(WeightRequest(transfer, self.mapping, transfer.layer.log2phy, loads, self.ready))
+            return
         plan = transfer.policy.plan(ids.tolist(), weights.float().tolist(), self.mapping.tolist())
         # Full routes are observed first; CPU then computes only unassigned
         # misses. Original device routes remain untouched.
@@ -134,6 +159,21 @@ class HostExpertTransfer:
             lrc=manager.cache_policy,
             layer_idx=self.layer_idx,
         )
+
+        self.native_planner = None
+        self.native_dma_cpu = getattr(manager.offload_config.cpu_moe, "native_dispatch_dma_cpu", None)
+        if self.native_dma_cpu is None:
+            self.native_dma_cpu = int(os.environ.get("KT_MOE_COMPLETION_CPU", "7"))
+        if getattr(manager.offload_config.cpu_moe, "native_dispatch", False):
+            from _vllm_ascend_lrc import NativeHostPlanner
+            policy = self.policy
+            if policy.lrc is not None and not hasattr(policy.lrc, "_native"):
+                raise ValueError("Native CPU dispatch requires C++ LRC when cache policy is enabled")
+            self.native_planner = NativeHostPlanner(
+                policy.experts, policy.slots, policy.layer_idx, policy.cpu_unit,
+                policy.cpu_unit + policy.copy_unit, policy.config.balance_max_transfers,
+                policy.config.transfer_policy, getattr(policy.lrc, "_native", None), policy.scores,
+                policy.npu_fixed_unit)
 
     def context(self, hidden, *, eager=False):
         if not eager:
@@ -170,3 +210,6 @@ def attach_host_transfers(manager):
             executor.backend._host_transfer = HostExpertTransfer(
                 manager, layer, executor.backend, manager._host_weight_worker
             )
+            if cpu.native_dispatch and manager.offload_config.expert_prefetch_enabled:
+                from .native_prefetch import NativePrefetchState
+                executor.backend._host_transfer.native_prefetch = NativePrefetchState(executor.backend._host_transfer)

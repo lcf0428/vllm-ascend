@@ -90,6 +90,7 @@ def maybe_attach_cpu_expert_backend(
         # blk.{layer_idx} prefix.  kt-kernel's per-layer GGUFs are written in
         # logical expert order, so its identity expert mapping is correct here.
         layer_idx=model_layer_idx,
+        native_dispatch=getattr(cpu_moe_config, "native_dispatch", False),
         # Every expert lives in the CPU-side GGUF; which of them actually
         # compute on CPU is decided per step from log2phy, not here.
         num_experts=moe_config.num_logical_experts,
@@ -116,3 +117,34 @@ def maybe_attach_cpu_expert_backend(
 
 
 __all__ = ["maybe_attach_cpu_expert_backend", "model_layer_index"]
+
+
+def attach_or_defer_cpu_expert_backend(manager, **kwargs):
+    """Allocate DMA storage before faulting/copying the GGUF working set.
+
+    Explicit host-weight NUMA placement opts into this startup ordering.
+    Finalization runs before profiling/capture; layers added later attach
+    immediately. Execution ownership and kernel math are unchanged.
+    """
+    cpu = kwargs["cpu_moe_config"]
+    if (cpu.enabled and cpu.weight_format == "gguf"
+            and getattr(cpu, "host_weight_numa_node", None) is not None
+            and not getattr(manager, "_cpu_weights_finalized", False)):
+        pending = getattr(manager, "_pending_cpu_backend_attachments", None)
+        if pending is None:
+            pending = manager._pending_cpu_backend_attachments = []
+        if not any(item["routed_experts"] is kwargs["routed_experts"] for item in pending):
+            pending.append(kwargs)
+        return None
+    return maybe_attach_cpu_expert_backend(**kwargs)
+
+
+def finalize_deferred_cpu_backends(manager):
+    """Load all deferred CPU weights before any graph can use the model."""
+    manager._cpu_weights_finalized = True
+    pending = getattr(manager, "_pending_cpu_backend_attachments", [])
+    for kwargs in pending:
+        maybe_attach_cpu_expert_backend(**kwargs)
+    count = len(pending)
+    pending.clear()
+    return count

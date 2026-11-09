@@ -4,8 +4,8 @@ import ctypes
 import json
 import logging
 import os
-import time
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -15,21 +15,16 @@ import torch_npu
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
-
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import (
-    CpuPrefetchTrace, NullCpuPrefetchTrace, Phase as CpuPrefetchPhase,
+    CpuPrefetchTrace,
+    NullCpuPrefetchTrace,
+)
+from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import (
+    Phase as CpuPrefetchPhase,
 )
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
-from vllm_ascend.expert_offload.h2d_transfer import (
-    CopyDirection,
-    H2DCopyTask,
-    HostPointerSource,
-    TorchCopyH2DTransport,
-    create_h2d_transport,
-)
-from vllm_ascend.expert_offload.lrc_policy import CppLRCExpertCachePolicy, LRCExpertCachePolicy
 from vllm_ascend.expert_offload.native_mxfp4_h2d import NativeExpertUploadTask, NativeMXFP4H2DTransport
 from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
@@ -38,6 +33,15 @@ from vllm_ascend.ops.fused_moe.experts_selector import (
     substitute_experts_device,
 )
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
+from vllm_ascend.expert_offload.h2d_transfer import (
+    CopyDirection,
+    H2DCopyTask,
+    HostPointerSource,
+    TorchCopyH2DTransport,
+    create_h2d_transport,
+)
+from vllm_ascend.expert_offload.lrc_policy import CppLRCExpertCachePolicy, LRCExpertCachePolicy
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
 
@@ -116,9 +120,16 @@ class ExpertOffloadManager:
         cpu = self.offload_config.cpu_moe
         self._host_hybrid_enabled = cpu.enabled and cpu.transfer_scheduler == "cpu"
         self._host_weight_worker = None
+        # Honor the requested prefetch setting. Host demand admission joins
+        # the target's prefetch event before reading residency or publishing
+        # its input-ready flag; C++ LRC serializes shared policy accesses.
+        self._host_prefetch_calls = 0
+        self._host_prefetch_loads = 0
         if self._host_hybrid_enabled and self.offload_config.expert_prefetch_enabled:
-            logger.info("[HYBRID-HOST] prefetch disabled: CPU owns demand admission and LRC")
-            self.offload_config.config["expert_prefetch_enabled"] = False
+            logger.info(
+                "[HYBRID-HOST] prefetch enabled: "
+                "host prefetch publishes weights/mapping before demand admission"
+            )
         if get_ascend_config().benchmark_route_stats_enabled is True:
             if getattr(vllm_config.scheduler_config, "async_scheduling", False) is True:
                 raise ValueError("benchmark_route_stats_enabled currently requires --no-async-scheduling for exact final-step acceptance")
@@ -651,6 +662,14 @@ class ExpertOffloadManager:
         w13_shape = (_w13.shape[2], _w13.shape[1])
         w2_shape = (_w2.shape[2], _w2.shape[1])
 
+        weight_mib = (
+            (int(_w13.shape[1]) * int(_w13.shape[2]) + int(_w2.shape[1]) * int(_w2.shape[2]))
+            * _w13.element_size()
+            * ntotal
+            / (1024**2)
+        )
+        logger.info("[EXPERT-HOST-SIZE] layer=%d dtype=%s w13=%s w2=%s experts=%d weight_mib=%.1f",
+                    layer_moe_idx, params_dtype, w13_shape, w2_shape, ntotal, weight_mib)
         use_shard = self.offload_config.shard_per_rank
         if use_shard:
             # shard-per-rank: each rank holds ONLY its EP shard of weight
@@ -1004,6 +1023,12 @@ class ExpertOffloadManager:
         t_hot = time.perf_counter()
         self.create_prefill_pool()
         t6 = time.perf_counter()
+        if self._host_hybrid_enabled:
+            from vllm_ascend.expert_offload.cpu_backend.wiring import finalize_deferred_cpu_backends
+
+            loaded = finalize_deferred_cpu_backends(self)
+            if loaded:
+                logger.info("[EXPERT-HOST-ALLOC] loaded %d CPU backends after DMA weight allocation", loaded)
         if self.offload_config.expert_prefetch_enabled:
             self.register_gate_weights(model)
             # Pinned staging buffer for graph-mode prefetch: trigger_next_
@@ -2494,6 +2519,7 @@ class ExpertOffloadManager:
         if predictor is not None:
             predictor.finish(layer_idx)
 
+
     def _finish_next_layer_predict(self, layer_idx: int, compute_stream) -> None:
         """Dispatch a layer-shifted predictor's prediction for layer_idx + 1.
 
@@ -3262,7 +3288,6 @@ class ExpertOffloadManager:
             ) = args[:12]
         decode_start = time.perf_counter() if self._debug else None
         from vllm.distributed.parallel_state import get_ep_group
-
         from vllm_ascend.expert_offload.multi_card_planner import plan_placement
 
         cpu_group = get_ep_group().cpu_group if self.ep_size > 1 else None
@@ -3568,7 +3593,18 @@ class ExpertOffloadManager:
 
     def _allocate_expert_host_tensor(self, shape, dtype) -> torch.Tensor:
         """Allocate weight/quant storage owned by the selected H2D backend."""
-        return self._get_h2d_transport().allocate_host_tensor(shape, dtype)
+        allocator = getattr(self, "_expert_host_allocator", None)
+        if allocator is None:
+            from .host_weight_allocator import HostWeightAllocator
+
+            cpu = getattr(getattr(self, "offload_config", None), "cpu_moe", None)
+            node = getattr(cpu, "host_weight_numa_node", None)
+            allocator = self._expert_host_allocator = HostWeightAllocator(node)
+            if node is not None:
+                logger.info("[EXPERT-HOST-ALLOC] DMA weights NUMA=%d allocation_cpu=%d; "
+                            "CPU expert NUMA configuration unchanged",
+                            node, allocator.cpu)
+        return allocator.allocate(self._get_h2d_transport().allocate_host_tensor, shape, dtype)
 
     def _synchronize_h2d(self, stream=None) -> None:
         """Retire copies on the explicit worker DMA stream, or original default."""
@@ -3726,22 +3762,55 @@ class ExpertOffloadManager:
             # float32 tensor and the extra device-to-device copy.
             layer.w13_weight_scale_fp32[slot].copy_(layer.w13_weight_scale.data[slot])
 
-    def _load_expert_weights_into_slots(self, layer, layer_idx, loads):
-        """Batch H2D-copy ``(slot, eid)`` loads, then refresh derived data."""
+    def _load_expert_weights_into_slots(self, layer, layer_idx, loads, timing=None):
+        """Submit each expert before preparing the next, on the same stream."""
+        if timing is not None:
+            from .dma_submit_timing import stamp
+            timing['submission_mode'] = 'per_expert_pipeline'
+            timing['expert_submissions'] = []
         trace = self._prefetch_trace
-        trace.mark(CpuPrefetchPhase.DESCRIPTOR_BEGIN)
         loads = list(loads)
-        tasks = []
-        for slot, eid in loads:
-            tasks.extend(self._build_expert_h2d_tasks(layer, layer_idx, eid, slot))
-        trace.mark(CpuPrefetchPhase.DESCRIPTOR_END, len(tasks), len(loads))
-        trace.mark(CpuPrefetchPhase.COPY_BATCH_BEGIN, len(tasks), len(loads))
-        self._get_h2d_transport().copy_batch(tasks)
-        trace.mark(CpuPrefetchPhase.COPY_BATCH_END)
+        transport = self._get_h2d_transport()
+        for index, (slot, eid) in enumerate(loads):
+            expert_timing = None
+            if timing is not None:
+                expert_timing = {'slot': slot, 'expert': eid}
+                stamp(expert_timing, 'descriptor_begin')
+                if index == 0:
+                    stamp(timing, 'descriptor_begin')
+            trace.mark(CpuPrefetchPhase.DESCRIPTOR_BEGIN)
+            tasks = self._build_expert_h2d_tasks(layer, layer_idx, eid, slot)
+            if timing is not None:
+                stamp(expert_timing, 'descriptor_end')
+                if index == 0:
+                    # The first-copy delay now includes only the first expert.
+                    stamp(timing, 'descriptor_end')
+            trace.mark(CpuPrefetchPhase.DESCRIPTOR_END, len(tasks), 1)
+            trace.mark(CpuPrefetchPhase.COPY_BATCH_BEGIN, len(tasks), 1)
+            if timing is not None and hasattr(transport, 'copy_batch_timed'):
+                transport.copy_batch_timed(tasks, expert_timing)
+                if index == 0:
+                    for name in ('first_copy_call_enter', 'first_copy_call_return'):
+                        for suffix in ('_ns', '_cpu_ns'):
+                            key = name + suffix
+                            if key in expert_timing:
+                                timing[key] = expert_timing[key]
+            else:
+                transport.copy_batch(tasks)
+            if timing is not None:
+                stamp(expert_timing, 'batch_copy_return')
+                timing['expert_submissions'].append(expert_timing)
+            trace.mark(CpuPrefetchPhase.COPY_BATCH_END)
+        if timing is not None:
+            stamp(timing, 'batch_copy_return')
+        # Keep derived NPU work behind all H2D submissions. The caller then
+        # copies the mapping and publishes ready on this same DMA stream.
         trace.mark(CpuPrefetchPhase.SCALE_REFRESH_BEGIN)
         for slot, _ in loads:
             self._refresh_expert_fp32_scale(layer, slot)
         trace.mark(CpuPrefetchPhase.SCALE_REFRESH_END)
+        if timing is not None:
+            stamp(timing, 'scale_refresh_return')
 
 
     def _load_expert_weights_into_slot(self, layer, layer_idx, eid, slot):
@@ -4258,6 +4327,12 @@ class ExpertOffloadManager:
                 return dma_done
             self._synchronize_h2d(stream=chosen_load_stream)
             trace.mark(CpuPrefetchPhase.H2D_SYNC_END)
+            if is_prefetch and getattr(self, "_host_hybrid_enabled", False):
+                self._host_prefetch_calls += 1
+                self._host_prefetch_loads += len(planned_loads)
+                if self._host_prefetch_calls == 1 or self._host_prefetch_calls % 1024 == 0:
+                    logger.info("[HYBRID-HOST] prefetch completed calls=%d loads=%d",
+                                self._host_prefetch_calls, self._host_prefetch_loads)
         trace.mark(CpuPrefetchPhase.LOAD_STREAM_EXIT)
 
     def _preload_hot_experts(self):
@@ -4645,6 +4720,10 @@ class ExpertOffloadManager:
 
         `staged` is exactly _stage_predicted_topk's return tuple.
         """
+        if self._host_hybrid_enabled and self.offload_config.cpu_moe.native_dispatch:
+            from .native_prefetch import dispatch_native_prefetch
+            dispatch_native_prefetch(self, staged)
+            return
         (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h) = staged
         static_id = self._prefetch_trace.next_static_id()
         capturing = bool(_EXTRA_CTX.capturing)
@@ -4711,6 +4790,9 @@ class ExpertOffloadManager:
             predicted = self.predict_next_layer_experts_npu(layer_idx, hidden_states)
         if predicted is None:
             return None
+        if self._host_hybrid_enabled and self.offload_config.cpu_moe.native_dispatch:
+            from .native_prefetch import stage_native_prefetch
+            return stage_native_prefetch(self, next_idx, predicted, bool(_EXTRA_CTX.capturing))
         stage_static_id = self._prefetch_trace.next_static_id()
         stage_capturing = bool(_EXTRA_CTX.capturing)
         self._prefetch_trace.mark_static(CpuPrefetchPhase.STATIC_STAGING_BEGIN,

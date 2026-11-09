@@ -20,8 +20,8 @@
 import copy
 import gc
 import inspect
-import os
 import logging
+import os
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import Any
@@ -29,6 +29,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch_npu
+import vllm_ascend.envs as envs_ascend
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
@@ -69,9 +70,6 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
-
-import vllm_ascend.envs as envs_ascend
-from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
@@ -96,7 +94,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
     check_ascend_device_type,
     enable_custom_op,
@@ -106,6 +103,9 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
+from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -765,6 +765,59 @@ class NPUWorker(WorkerBase):
             self.torch_reserved / GiB_bytes,
             self.torch_allocated / GiB_bytes,
         )
+
+    def read_memory_stats(self) -> dict:
+        """Return current/peak torch NPU memory stats plus KV pool size.
+
+        Callable from outside via: POST /collective_rpc
+        {"method": "read_memory_stats"}  (requires VLLM_SERVER_DEV_MODE=1).
+        Note: torch "allocated" includes the fully preallocated KV cache
+        pool; combine with the vllm:kv_cache_usage_perc metric to get the
+        actually-used KV bytes.
+        """
+        kv_pool_bytes = None
+        try:
+            seen = set()
+            uniq = []
+
+            def _collect(obj):
+                if isinstance(obj, torch.Tensor):
+                    if obj.untyped_storage().data_ptr() not in seen:
+                        seen.add(obj.untyped_storage().data_ptr())
+                        uniq.append(obj)
+                elif isinstance(obj, (list, tuple)):
+                    for o in obj:
+                        _collect(o)
+
+            _collect(list(self.model_runner.kv_caches))
+            kv_pool_bytes = sum(t.nbytes for t in uniq)
+        except Exception:
+            pass
+        num_gpu_blocks = getattr(self.vllm_config.cache_config,
+                                 "num_gpu_blocks", None)
+        kv_pool_tokens = (num_gpu_blocks * self.cache_config.block_size
+                          if num_gpu_blocks else None)
+        # Authoritative KV budget from the engine's own memory accounting
+        # (matches the startup log line "Available KV cache memory").
+        kv_budget_bytes = getattr(self, "available_kv_cache_memory_bytes", None)
+        return {
+            "allocated_gib": torch.npu.memory_allocated() / GiB_bytes,
+            "max_allocated_gib": torch.npu.max_memory_allocated() / GiB_bytes,
+            "reserved_gib": torch.npu.memory_reserved() / GiB_bytes,
+            "max_reserved_gib": torch.npu.max_memory_reserved() / GiB_bytes,
+            "kv_pool_gib": (kv_pool_bytes / GiB_bytes
+                            if kv_pool_bytes is not None else None),
+            "kv_pool_tokens": kv_pool_tokens,
+            "kv_pool_budget_gib": (kv_budget_bytes / GiB_bytes
+                                   if kv_budget_bytes is not None else None),
+        }
+
+    def reset_memory_stats(self) -> None:
+        """Reset torch peak memory counters; call between benchmark rounds.
+
+        Callable via: POST /collective_rpc {"method": "reset_memory_stats"}.
+        """
+        torch.npu.reset_peak_memory_stats()
 
     def execute_model(
         self,

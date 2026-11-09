@@ -1,5 +1,6 @@
 """Report-thread callback must fail visibly without leaking the GIL."""
 import ast
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ def callback(exits):
     tree = ast.parse(source.read_text())
     manager = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'ExpertOffloadManager')
     method = next(n for n in manager.body if isinstance(n, ast.FunctionDef) and n.name == '_run_prefetch_callback')
-    namespace = {'torch': torch, 'os': SimpleNamespace(_exit=exits.append)}
+    namespace = {'torch': torch, 'threading': threading, 'os': SimpleNamespace(_exit=exits.append)}
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), namespace)
     return namespace['_run_prefetch_callback']
 

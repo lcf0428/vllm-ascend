@@ -27,7 +27,6 @@ from pydantic import ConfigDict, TypeAdapter, field_serializer, field_validator,
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
-
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
@@ -1785,6 +1784,13 @@ class CpuMoeConfig:
         # first_miss preserves the original policy; frequency admits recent hotspots.
         "transfer_policy": "first_miss",
         "transfer_scheduler": "cpu",
+        # Register graph tasks once; CPU poll/submit/completion run without Python.
+        "native_dispatch": False,
+        # Dedicated DMA logical CPU; None uses the existing completion CPU.
+        "native_dispatch_dma_cpu": None,
+        # NUMA placement of NPU DMA source weight/quant buffers only.
+        # CPU expert GGUF weights and compute pools still use numa_nodes.
+        "host_weight_numa_node": None,
         "transfer_copy_library": "",
         "transfer_trace_capacity": 0,
         "transfer_trace_mode": 1,
@@ -1794,6 +1800,7 @@ class CpuMoeConfig:
         "balance_cpu_extra_route_us": 10.0,
         "balance_copy_us": 450.0,
         "balance_npu_route_us": 2.0,
+        "balance_npu_fixed_us": 0.0,
         "balance_min_gain_us": 20.0,
     }
 
@@ -1892,6 +1899,14 @@ class CpuMoeConfig:
             raise ValueError("Transfer trace requires the NPU scheduler")
         if self.config["transfer_scheduler"] not in ("cpu", "npu"):
             raise ValueError("cpu_moe.transfer_scheduler must be cpu or npu")
+        if not isinstance(self.config["native_dispatch"], bool):
+            raise ValueError("cpu_moe.native_dispatch must be boolean")
+        dma_cpu = self.config["native_dispatch_dma_cpu"]
+        if dma_cpu is not None and (isinstance(dma_cpu, bool) or not isinstance(dma_cpu, int) or dma_cpu < 0):
+            raise ValueError("native_dispatch_dma_cpu must be a non-negative CPU index or None")
+        host_node = self.config["host_weight_numa_node"]
+        if host_node is not None and (isinstance(host_node, bool) or not isinstance(host_node, int) or host_node < 0):
+            raise ValueError("host_weight_numa_node must be a non-negative NUMA index or None")
         if self.config["enabled"] and self.config["transfer_scheduler"] != "cpu":
             raise ValueError("CPU MoE now uses host admission/DMA; set transfer_scheduler=cpu")
         if self.config["transfer_scheduler"] == "npu" and not self.config["transfer_copy_library"]:
@@ -1906,7 +1921,14 @@ class CpuMoeConfig:
         limit = self.config["balance_max_transfers"]
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
             raise ValueError("cpu_moe.balance_max_transfers must be an integer in [1,32]")
-        for key in ("balance_cpu_expert_us", "balance_cpu_extra_route_us", "balance_copy_us", "balance_npu_route_us", "balance_min_gain_us"):
+        for key in (
+            "balance_cpu_expert_us",
+            "balance_cpu_extra_route_us",
+            "balance_copy_us",
+            "balance_npu_route_us",
+            "balance_npu_fixed_us",
+            "balance_min_gain_us",
+        ):
             value = self.config[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < float("inf"):
                 raise ValueError(f"cpu_moe.{key} must be finite and nonnegative")

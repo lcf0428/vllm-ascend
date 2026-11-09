@@ -90,7 +90,7 @@ class TorchCopyH2DTransport:
     def allocate_host_tensor(self, shape, dtype) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
 
-    def copy_batch(self, tasks: list[H2DCopyTask]) -> None:
+    def copy_batch(self, tasks: list[H2DCopyTask], *, timing=None) -> None:
         cpu_diag = getattr(self, "_cpu_prefetch_trace", None)
         trace_local = getattr(cpu_diag, "_local", None)
         if isinstance(trace_local, threading.local) and getattr(trace_local, "context", None) is None:
@@ -100,9 +100,17 @@ class TorchCopyH2DTransport:
         for index, task in enumerate(tasks):
             if cpu_diag is not None:
                 cpu_diag.mark(CpuPrefetchPhase.COPY_FIELD_BEGIN, index, task.nbytes)
+            if index == 0 and timing is not None:
+                from .dma_submit_timing import stamp
+                stamp(timing, 'first_copy_call_enter')
             task.destination.copy_(task.source, non_blocking=task.non_blocking)
+            if index == 0 and timing is not None:
+                stamp(timing, 'first_copy_call_return')
             if cpu_diag is not None:
                 cpu_diag.mark(CpuPrefetchPhase.COPY_FIELD_END, index, task.nbytes)
+
+    def copy_batch_timed(self, tasks, timing):
+        self.copy_batch(tasks, timing=timing)
 
     @staticmethod
     def synchronize(stream) -> None:

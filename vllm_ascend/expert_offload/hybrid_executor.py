@@ -196,13 +196,12 @@ class PreparedHybridRoutes:
 
     Phase A (``begin_hybrid_routes``) finishes the pending prefetch join and
     preprocesses routes (substitution / pruning / transfer handle), but does
-    NOT submit the current layer's CPU MoE task yet. The caller can therefore
-    fire the next-layer prefetch signal (prediction + selector + notify)
-    between the two phases, so the prefetch chain starts before the current
-    layer's CPU D2H copies and ready-flag publish.
+    NOT submit the current layer's CPU MoE task yet.
 
-    Phase B (``finish``) performs the CPU input copies and the backend submit
-    exactly as the previous single-shot path did.
+    Phase B (``finish``) performs CPU input copies/backend submission and
+    joins demand-weight readiness on the main stream. The caller launches
+    next-layer prefetch after this phase, so speculative DMA cannot delay
+    this layer's demand DMA. CPU compute completion remains independent.
     """
 
     def __init__(self, executor, *, hidden_states, topk_ids, topk_weights,
@@ -278,7 +277,13 @@ def begin_hybrid_routes(
         with transfer_manager._prefetch_state_lock:
             pending_event = transfer_manager._prefetch_layer_npu_event.pop(executor.layer_idx, None)
         if pending_event is not None:
-            torch_npu.npu.current_stream().wait_event(pending_event)
+            try:
+                torch_npu.npu.current_stream().wait_event(pending_event)
+            except RuntimeError:
+                from vllm.logger import logger
+                logger.exception("Prefetch join failed: layer=%s shape=%s event_type=%s",
+                                 executor.layer_idx, tuple(hidden_states.shape), type(pending_event).__name__)
+                raise
 
     # Reuse the paging route substitution before deciding CPU/NPU ownership.
     # Hash-routed layers are intentionally excluded, just as in update_weights.

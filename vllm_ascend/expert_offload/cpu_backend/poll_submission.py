@@ -5,10 +5,19 @@ The int32 sequence is copied after all input copies on the same stream.
 Only supported on coherent x86 host memory; pinned slots remain alive for the
 engine lifetime. A missed sequence aborts rather than using stale inputs.
 """
-import atexit,ctypes,json,logging,os,threading,time
+import atexit
+import ctypes
+import json
+import logging
+import os
+import threading
+import time
 from functools import partial
+
 import torch
+
 from . import async_completion
+
 _LOG=logging.getLogger(__name__)
 _WORKER=None
 _LOCK=threading.Lock()
@@ -113,7 +122,12 @@ def prepare(backend):
     backend._poll_sequence_slots=[(backend._poll_sequence_device[i,:1],backend._poll_sequence_host[i,:1]) for i in range(64)]
     backend._poll_sequence_used=0
     with _LOCK:
-        if _WORKER is None:_WORKER=PollWorker(device)
+        if _WORKER is None:
+            if getattr(backend.config, "native_dispatch", False):
+                from .native_submission import NativePollWorker
+                _WORKER = NativePollWorker(device)
+            else:
+                _WORKER = PollWorker(device)
 
 def record_submission(backend,hidden,stream,ready,before_submit=None):
     slot=backend._poll_sequence_used

@@ -327,7 +327,7 @@ class CppLRCExpertCachePolicy:
 
     ``layer_states`` provides diagnostic snapshots, not mutable live state.
     Use the public policy methods to update state. The original Python class
-    remains unchanged. Bindings retain the GIL to serialize state access.
+    remains unchanged. Bindings retain the GIL; a native state mutex also protects graph admission.
     """
 
     def __init__(self, **kwargs):

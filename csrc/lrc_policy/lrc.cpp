@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// CPU-only LRC state. Keep GIL held: callbacks must not concurrently mutate it.
+// CPU-only LRC state shared by Python and native graph admission; mutex protected.
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <mutex>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -72,6 +73,7 @@ class Policy {
   }
 
  public:
+  std::recursive_mutex state_mutex;
   Policy(Id layers, Id experts, Id window, double beta, double recent, double ema_weight, double router_weight,
          double age_weight, bool scalar_f32)
       : experts_(experts),
@@ -87,14 +89,16 @@ class Policy {
     for (Id i = 0; i < layers; ++i) layers_.emplace_back(experts);
   }
   Id add_layer() {
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
     layers_.emplace_back(experts_);
     return static_cast<Id>(layers_.size()) - 1;
   }
   Id num_layers() const { return layers_.size(); }
-  Id step(Id idx) { return layer(idx).step; }
+  Id step(Id idx) { std::lock_guard<std::recursive_mutex> lock(state_mutex); return layer(idx).step; }
 
   std::unordered_set<Id> observe_values(Id idx, const std::vector<std::vector<Id>>& rows,
                                         const std::vector<std::vector<double>>& scores, bool has_scores) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex);
     auto& s = layer(idx);
     std::unordered_set<Id> unique;
     for (size_t r = 0; r < rows.size(); ++r) {
@@ -279,6 +283,7 @@ class Policy {
       scores = score_obj.cast<std::vector<float>>();
       if (scores.size() != counts.size()) throw py::value_error("global_router_score has wrong shape");
     }
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex);
     auto& s = layer(idx);
     ++s.step;
     Counts snapshot;
@@ -304,6 +309,7 @@ class Policy {
                          Id count) {
     if (count < 0) throw py::value_error("victim count must be >= 0");
     if (!count) return {};
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex);
     const auto& s = layer(idx);
     std::vector<std::tuple<double, Id, Id>> keys;
     for (Id e : residents) {
@@ -314,8 +320,9 @@ class Policy {
     for (Id i = 0; i < std::min(count, static_cast<Id>(keys.size())); ++i) result.push_back(std::get<2>(keys[i]));
     return result;
   }
-  double hotness(Id idx, Id e) { return score(layer(idx), expert(e)); }
+  double hotness(Id idx, Id e) { std::lock_guard<std::recursive_mutex> lock(state_mutex); return score(layer(idx), expert(e)); }
   std::vector<float> hotness_array(Id idx) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex);
     const auto& s = layer(idx);
     std::vector<float> result(experts_);
     for (Id e = 0; e < experts_; ++e) {
@@ -329,6 +336,7 @@ class Policy {
     return result;
   }
   void seed(Id idx, Id eid, Id freq, double weight) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex);
     auto& s = layer(idx);
     Id e = expert(eid);
     s.freq[e] = freq;
@@ -336,6 +344,7 @@ class Policy {
     s.last[e] = s.step;
   }
   py::dict snapshot(Id idx) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex);
     const auto& s = layer(idx);
     py::dict d;
     d["freq"] = s.freq;
@@ -348,7 +357,35 @@ class Policy {
   }
 };
 
+#ifdef __linux__
+#include "native_dispatch.h"
+#endif
+
 PYBIND11_MODULE(_vllm_ascend_lrc, m) {
+#ifdef __linux__
+  m.attr("native_dispatch_api_version") = 1;
+  py::class_<NativePlan>(m, "NativePlan")
+      .def_readonly("mapping", &NativePlan::mapping).def_readonly("loads", &NativePlan::loads)
+      .def_readonly("cpu_ids", &NativePlan::ids).def_readonly("cpu_weights", &NativePlan::weights);
+  py::class_<NativeHostPlanner, std::shared_ptr<NativeHostPlanner>>(m, "NativeHostPlanner")
+      .def(py::init<Id, Id, Id, Id, Id, Id, std::string, Policy*, std::vector<double>, Id>(),
+           py::arg("experts"), py::arg("slots"), py::arg("layer"), py::arg("numerator"),
+           py::arg("denominator"), py::arg("max_transfers"), py::arg("policy"),
+           py::arg("lrc"), py::arg("scores"), py::arg("npu_fixed_cost") = 0, py::keep_alive<1, 9>())
+      .def("plan", &NativeHostPlanner::plan)
+      .def("plan_prefetch", &NativeHostPlanner::plan_prefetch)
+      .def("prepare_prefetch", &NativeHostPlanner::prepare_prefetch)
+      .def("prepare", &NativeHostPlanner::prepare);
+  py::class_<NativeCpuDispatcher>(m, "NativeCpuDispatcher")
+      .def(py::init<py::capsule, uintptr_t, uintptr_t, int, int>())
+      .def("add", &NativeCpuDispatcher::add)
+      .def("add_prefetch", &NativeCpuDispatcher::add_prefetch)
+      .def("prefetch_stats", &NativeCpuDispatcher::prefetch_stats)
+      .def("next_weight", &NativeCpuDispatcher::next_weight, py::call_guard<py::gil_scoped_release>())
+      .def("next_weight_details", &NativeCpuDispatcher::next_weight_details, py::call_guard<py::gil_scoped_release>())
+      .def("stats", &NativeCpuDispatcher::stats)
+      .def("close", &NativeCpuDispatcher::close, py::call_guard<py::gil_scoped_release>());
+#endif
   m.attr("api_version") = 3;
   py::class_<LoadSubmitMigration>(m, "LoadSubmitMigration")
       .def(py::init<py::object, py::object, py::object>())
