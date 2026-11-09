@@ -4,8 +4,8 @@ import ctypes
 import json
 import logging
 import os
-import threading
 import time
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -15,25 +15,13 @@ import torch_npu
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
+
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import (
-    CpuPrefetchTrace,
-    NullCpuPrefetchTrace,
-)
-from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import (
-    Phase as CpuPrefetchPhase,
+    CpuPrefetchTrace, NullCpuPrefetchTrace, Phase as CpuPrefetchPhase,
 )
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
-from vllm_ascend.expert_offload.native_mxfp4_h2d import NativeExpertUploadTask, NativeMXFP4H2DTransport
-from vllm_ascend.ops.fused_moe.experts_selector import (
-    commit_expert_substitutions,
-    maybe_prune_topk_experts,
-    plan_expert_substitutions,
-    substitute_experts_device,
-)
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
-
 from vllm_ascend.expert_offload.h2d_transfer import (
     CopyDirection,
     H2DCopyTask,
@@ -42,6 +30,14 @@ from vllm_ascend.expert_offload.h2d_transfer import (
     create_h2d_transport,
 )
 from vllm_ascend.expert_offload.lrc_policy import CppLRCExpertCachePolicy, LRCExpertCachePolicy
+from vllm_ascend.expert_offload.native_mxfp4_h2d import NativeExpertUploadTask, NativeMXFP4H2DTransport
+from vllm_ascend.ops.fused_moe.experts_selector import (
+    commit_expert_substitutions,
+    maybe_prune_topk_experts,
+    plan_expert_substitutions,
+    substitute_experts_device,
+)
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
 
@@ -126,10 +122,7 @@ class ExpertOffloadManager:
         self._host_prefetch_calls = 0
         self._host_prefetch_loads = 0
         if self._host_hybrid_enabled and self.offload_config.expert_prefetch_enabled:
-            logger.info(
-                "[HYBRID-HOST] prefetch enabled: "
-                "host prefetch publishes weights/mapping before demand admission"
-            )
+            logger.info("[HYBRID-HOST] prefetch enabled: host prefetch publishes weights/mapping before demand admission")
         if get_ascend_config().benchmark_route_stats_enabled is True:
             if getattr(vllm_config.scheduler_config, "async_scheduling", False) is True:
                 raise ValueError("benchmark_route_stats_enabled currently requires --no-async-scheduling for exact final-step acceptance")
@@ -662,12 +655,7 @@ class ExpertOffloadManager:
         w13_shape = (_w13.shape[2], _w13.shape[1])
         w2_shape = (_w2.shape[2], _w2.shape[1])
 
-        weight_mib = (
-            (int(_w13.shape[1]) * int(_w13.shape[2]) + int(_w2.shape[1]) * int(_w2.shape[2]))
-            * _w13.element_size()
-            * ntotal
-            / (1024**2)
-        )
+        weight_mib = (int(_w13.shape[1]) * int(_w13.shape[2]) + int(_w2.shape[1]) * int(_w2.shape[2])) * _w13.element_size() * ntotal / (1024 ** 2)
         logger.info("[EXPERT-HOST-SIZE] layer=%d dtype=%s w13=%s w2=%s experts=%d weight_mib=%.1f",
                     layer_moe_idx, params_dtype, w13_shape, w2_shape, ntotal, weight_mib)
         use_shard = self.offload_config.shard_per_rank
@@ -3288,6 +3276,7 @@ class ExpertOffloadManager:
             ) = args[:12]
         decode_start = time.perf_counter() if self._debug else None
         from vllm.distributed.parallel_state import get_ep_group
+
         from vllm_ascend.expert_offload.multi_card_planner import plan_placement
 
         cpu_group = get_ep_group().cpu_group if self.ep_size > 1 else None
@@ -3601,8 +3590,7 @@ class ExpertOffloadManager:
             node = getattr(cpu, "host_weight_numa_node", None)
             allocator = self._expert_host_allocator = HostWeightAllocator(node)
             if node is not None:
-                logger.info("[EXPERT-HOST-ALLOC] DMA weights NUMA=%d allocation_cpu=%d; "
-                            "CPU expert NUMA configuration unchanged",
+                logger.info("[EXPERT-HOST-ALLOC] DMA weights NUMA=%d allocation_cpu=%d; CPU expert NUMA configuration unchanged",
                             node, allocator.cpu)
         return allocator.allocate(self._get_h2d_transport().allocate_host_tensor, shape, dtype)
 

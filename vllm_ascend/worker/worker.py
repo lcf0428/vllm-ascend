@@ -20,8 +20,8 @@
 import copy
 import gc
 import inspect
-import logging
 import os
+import logging
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import Any
@@ -29,7 +29,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch_npu
-import vllm_ascend.envs as envs_ascend
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
@@ -70,6 +69,9 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
+
+import vllm_ascend.envs as envs_ascend
+from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
@@ -94,6 +96,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
     check_ascend_device_type,
     enable_custom_op,
@@ -103,9 +106,6 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-
-from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
-from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402

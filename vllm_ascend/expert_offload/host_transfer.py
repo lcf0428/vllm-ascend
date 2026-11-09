@@ -12,8 +12,8 @@ from dataclasses import dataclass
 import torch
 import torch_npu
 
-from .dma_submit_timing import stamp
 from .host_transfer_policy import HostTransferPolicy
+from .dma_submit_timing import stamp
 
 _LOG = logging.getLogger(__name__)
 
@@ -62,9 +62,7 @@ class HostWeightWorker:
             if timing is None:
                 self.manager._load_expert_weights_into_slots(transfer.layer, transfer.layer_idx, request.loads)
             else:
-                self.manager._load_expert_weights_into_slots(
-                    transfer.layer, transfer.layer_idx, request.loads, timing=timing
-                )
+                self.manager._load_expert_weights_into_slots(transfer.layer, transfer.layer_idx, request.loads, timing=timing)
             request.mapping_device.copy_(request.mapping_host, non_blocking=True)
             stamp(timing, 'mapping_return')
             # Record on DMA itself after weights, quant attributes and mapping.
@@ -79,9 +77,7 @@ class HostWeightWorker:
             cpu = getattr(getattr(self.manager, "offload_config", None), "cpu_moe", None)
             if getattr(cpu, "native_dispatch", False):
                 core = cpu.native_dispatch_dma_cpu
-                os.sched_setaffinity(
-                    0, {core if core is not None else int(os.environ.get("KT_MOE_COMPLETION_CPU", "7"))}
-                )
+                os.sched_setaffinity(0, {core if core is not None else int(os.environ.get("KT_MOE_COMPLETION_CPU", "7"))})
             while True:
                 request = self.jobs.get()
                 if request is None:

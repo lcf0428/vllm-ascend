@@ -23,20 +23,16 @@ def test_selected_node_restores_caller_affinity(monkeypatch, failure):
     current = {32, 33, 62, 63}
     changes = []
     monkeypatch.setattr(module.os, "sched_getaffinity", lambda _: set(current))
-
     def change(_, mask):
         changes.append(set(mask))
         current.clear()
         current.update(mask)
-
     monkeypatch.setattr(module.os, "sched_setaffinity", change)
-
     def allocate(shape, dtype):
         assert current == {0}
         if failure:
             raise RuntimeError("driver allocation failed")
         return shape, dtype
-
     monkeypatch.setattr(module.HostWeightAllocator, "_save_policy", lambda _: "old_strict_policy")
     policy_events = []
     monkeypatch.setattr(module.HostWeightAllocator, "_select_policy", lambda _: policy_events.append("select"))
@@ -56,3 +52,4 @@ def test_selected_node_restores_caller_affinity(monkeypatch, failure):
 def test_invalid_node_is_rejected(node):
     with pytest.raises(ValueError, match="host_weight_numa_node"):
         module.HostWeightAllocator(node)
+

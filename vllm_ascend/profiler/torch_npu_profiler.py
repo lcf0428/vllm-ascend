@@ -93,7 +93,6 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
 
     def _start(self) -> None:
         import os
-
         import torch
         if os.environ.get("CPU_MOE_CLOCK_ANCHORS") == "1":
             torch.npu.synchronize()
@@ -105,7 +104,6 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
 
     def _stop(self) -> None:
         import os
-
         import torch
         if os.environ.get("CPU_MOE_CLOCK_ANCHORS") == "1":
             # Caller must finish benchmark responses before requesting stop.

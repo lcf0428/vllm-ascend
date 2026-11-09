@@ -24,22 +24,17 @@ def _load_native_wait():
         import sys
         import sysconfig
         from pathlib import Path
-
         try:
             _NATIVE_WAIT_OPS = importlib.import_module("_vllm_ascend_prefetch_wait")
         except ModuleNotFoundError as error:
             if error.name != "_vllm_ascend_prefetch_wait":
                 raise
             import _vllm_ascend_lrc
-
             path = Path(_vllm_ascend_lrc.__file__).with_name(
-                "_vllm_ascend_prefetch_wait" + sysconfig.get_config_var("EXT_SUFFIX")
-            )
+                "_vllm_ascend_prefetch_wait" + sysconfig.get_config_var("EXT_SUFFIX"))
             if not path.is_file():
-                raise ImportError(
-                    "Build native prefetch wait with: cd csrc/lrc_policy && "
-                    "python setup_npu_wait.py build_ext --inplace"
-                ) from error
+                raise ImportError("Build native prefetch wait with: cd csrc/lrc_policy && "
+                                  "python setup_npu_wait.py build_ext --inplace") from error
             spec = importlib.util.spec_from_file_location("_vllm_ascend_prefetch_wait", path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
@@ -121,9 +116,8 @@ class NativePrefetchSite:
         self.transfer = transfer
         self.ids = torch.empty(tuple(ids.shape), dtype=torch.int32, pin_memory=True)
         self.weights = torch.empty(tuple(ids.shape), dtype=torch.float32, pin_memory=True)
-        self.mapping = torch.empty(
-            tuple(transfer.layer.log2phy.shape), dtype=transfer.layer.log2phy.dtype, pin_memory=True
-        )
+        self.mapping = torch.empty(tuple(transfer.layer.log2phy.shape), dtype=transfer.layer.log2phy.dtype,
+                                   pin_memory=True)
         self.ready = NativePrefetchReadyEvent()
         if not self.ready.npu_event:
             raise RuntimeError("Native prefetch requires value-based ExternalEvent support")

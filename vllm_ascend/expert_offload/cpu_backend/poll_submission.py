@@ -5,19 +5,10 @@ The int32 sequence is copied after all input copies on the same stream.
 Only supported on coherent x86 host memory; pinned slots remain alive for the
 engine lifetime. A missed sequence aborts rather than using stale inputs.
 """
-import atexit
-import ctypes
-import json
-import logging
-import os
-import threading
-import time
+import atexit,ctypes,json,logging,os,threading,time
 from functools import partial
-
 import torch
-
 from . import async_completion
-
 _LOG=logging.getLogger(__name__)
 _WORKER=None
 _LOCK=threading.Lock()

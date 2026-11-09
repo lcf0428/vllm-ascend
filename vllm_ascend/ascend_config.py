@@ -27,6 +27,7 @@ from pydantic import ConfigDict, TypeAdapter, field_serializer, field_validator,
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
+
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
@@ -1921,14 +1922,7 @@ class CpuMoeConfig:
         limit = self.config["balance_max_transfers"]
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
             raise ValueError("cpu_moe.balance_max_transfers must be an integer in [1,32]")
-        for key in (
-            "balance_cpu_expert_us",
-            "balance_cpu_extra_route_us",
-            "balance_copy_us",
-            "balance_npu_route_us",
-            "balance_npu_fixed_us",
-            "balance_min_gain_us",
-        ):
+        for key in ("balance_cpu_expert_us", "balance_cpu_extra_route_us", "balance_copy_us", "balance_npu_route_us", "balance_npu_fixed_us", "balance_min_gain_us"):
             value = self.config[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < float("inf"):
                 raise ValueError(f"cpu_moe.{key} must be finite and nonnegative")

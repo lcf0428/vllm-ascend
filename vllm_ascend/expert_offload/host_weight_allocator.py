@@ -27,13 +27,7 @@ class HostWeightAllocator:
             self.cpu = int(cpus.split(",")[0].split("-")[0])
             self.node = numa_node
             self._numa = ctypes.CDLL("libnuma.so.1", use_errno=True)
-            self._numa.get_mempolicy.argtypes = [
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.c_ulong),
-                ctypes.c_ulong,
-                ctypes.c_void_p,
-                ctypes.c_ulong,
-            ]
+            self._numa.get_mempolicy.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong), ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong]
             self._numa.set_mempolicy.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_ulong), ctypes.c_ulong]
 
     def _check(self, result):
@@ -74,19 +68,8 @@ class HostWeightAllocator:
                 try:
                     if hasattr(error, "add_note"):
                         mode, mask = self._save_policy()
-                        memory = [
-                            " ".join(
-                                line.strip()
-                                for line in Path(f"/sys/devices/system/node/node{n}/meminfo").read_text().splitlines()
-                                if "MemFree:" in line
-                            )
-                            for n in (0, 1)
-                        ]
-                        error.add_note(
-                            f"DMA host allocation: shape={shape} dtype={dtype} "
-                            f"affinity={sorted(os.sched_getaffinity(0))} mempolicy={mode} "
-                            f"nodemask={list(mask)} free={memory}"
-                        )
+                        memory = [" ".join(line.strip() for line in Path(f"/sys/devices/system/node/node{n}/meminfo").read_text().splitlines() if "MemFree:" in line) for n in (0, 1)]
+                        error.add_note(f"DMA host allocation: shape={shape} dtype={dtype} affinity={sorted(os.sched_getaffinity(0))} mempolicy={mode} nodemask={list(mask)} free={memory}")
                 except Exception:
                     pass
                 raise

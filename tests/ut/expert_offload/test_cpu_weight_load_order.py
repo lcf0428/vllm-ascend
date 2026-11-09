@@ -13,10 +13,8 @@ def test_explicit_placement_defers_only_startup(monkeypatch, explicit_node):
     attach = Mock(return_value=object())
     monkeypatch.setattr(wiring, "maybe_attach_cpu_expert_backend", attach)
     manager = SimpleNamespace()
-    kwargs = dict(
-        routed_experts=object(),
-        cpu_moe_config=SimpleNamespace(enabled=True, weight_format="gguf", host_weight_numa_node=explicit_node),
-    )
+    kwargs = dict(routed_experts=object(), cpu_moe_config=SimpleNamespace(
+        enabled=True, weight_format="gguf", host_weight_numa_node=explicit_node))
     result = wiring.attach_or_defer_cpu_expert_backend(manager, **kwargs)
     if explicit_node is None:
         assert result is attach.return_value

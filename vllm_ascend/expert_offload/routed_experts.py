@@ -8,10 +8,10 @@ full expert pool, leaving the persistent decode parameters unchanged.
 from copy import copy
 
 import torch
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.ops.fused_moe.moe_comm_method import _map_logical_ids_to_phy
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.expert_offload.expert_offload_manager import ExpertOffloadManager
+from vllm_ascend.ops.fused_moe.moe_comm_method import _map_logical_ids_to_phy
 
 
 def _build_prefill_split_ctx(mgr, layer, layer_idx: int):

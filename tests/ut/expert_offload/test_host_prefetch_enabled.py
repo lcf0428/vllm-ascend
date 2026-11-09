@@ -22,9 +22,7 @@ def test_host_initialization_preserves_requested_prefetch(enabled):
     for node in init.body:
         if isinstance(node, ast.ImportFrom):
             continue
-        if isinstance(node, ast.If) and ast.unparse(node.test).startswith(
-            "get_ascend_config().benchmark_route_stats_enabled"
-        ):
+        if isinstance(node, ast.If) and ast.unparse(node.test).startswith("get_ascend_config().benchmark_route_stats_enabled"):
             break
         body.append(node)
 
@@ -39,11 +37,7 @@ def test_host_initialization_preserves_requested_prefetch(enabled):
 
     cfg = Config()
     instance = SimpleNamespace()
-    namespace = {
-        "self": instance,
-        "get_ascend_config": lambda: SimpleNamespace(expert_offload_config=cfg),
-        "logger": Mock(),
-    }
+    namespace = {"self": instance, "get_ascend_config": lambda: SimpleNamespace(expert_offload_config=cfg), "logger": Mock()}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), namespace)
     assert instance._host_hybrid_enabled
     assert cfg.expert_prefetch_enabled is enabled
@@ -53,7 +47,6 @@ def test_host_initialization_preserves_requested_prefetch(enabled):
 def test_prefetch_join_precedes_demand_preparation(monkeypatch, pending):
     import torch_npu
     import vllm.forward_context as forward
-
     from vllm_ascend.expert_offload import hybrid_executor as hybrid
 
     operations = []
@@ -70,15 +63,9 @@ def test_prefetch_join_precedes_demand_preparation(monkeypatch, pending):
     monkeypatch.setattr(forward, "is_forward_context_available", lambda: False)
     monkeypatch.setattr(torch_npu.npu, "current_stream", lambda: stream)
     monkeypatch.setattr(hybrid, "PreparedHybridRoutes", lambda *a, **k: operations.append("demand_prepare"))
-    hybrid.begin_hybrid_routes(
-        object(),
-        hidden_states=torch.zeros(1, 4),
-        topk_ids=torch.tensor([[0]]),
-        topk_weights=torch.ones(1, 1),
-        log2phy=torch.tensor([0]),
-        transfer_manager=manager,
-    )
-    assert operations == (
-        ["predict_join", ("prefetch_join", event), "demand_prepare"] if pending else ["predict_join", "demand_prepare"]
-    )
+    hybrid.begin_hybrid_routes(object(), hidden_states=torch.zeros(1, 4),
+                               topk_ids=torch.tensor([[0]]), topk_weights=torch.ones(1, 1),
+                               log2phy=torch.tensor([0]), transfer_manager=manager)
+    assert operations == (["predict_join", ("prefetch_join", event), "demand_prepare"]
+                          if pending else ["predict_join", "demand_prepare"])
     assert not manager._prefetch_layer_npu_event

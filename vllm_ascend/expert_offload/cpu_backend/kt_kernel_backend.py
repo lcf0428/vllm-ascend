@@ -17,17 +17,17 @@ which is which.
 """
 
 from __future__ import annotations
+from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import Phase as CpuPrefetchPhase
 
+from dataclasses import dataclass
 import json
 import os
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
-from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import Phase as CpuPrefetchPhase
 
 
 def _eager_trace(event: str, **fields: Any) -> None:

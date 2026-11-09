@@ -1,8 +1,7 @@
 """Small real graph check; run only on the task's selected idle NPU/context."""
-
-import _native_dispatch_fixture as fixture
 import torch
 import torch_npu
+import _native_dispatch_fixture as fixture
 from _vllm_ascend_lrc import NativeCpuDispatcher, NativeHostPlanner
 
 print("DEVICE", flush=True)
@@ -26,22 +25,9 @@ address = fixture.address(task)
 print("ENGINE_INIT", flush=True)
 engine = NativeCpuDispatcher(fixture.api(), int(stream.npu_stream), int(stream.npu_stream), 62, 63)
 print("REGISTER", flush=True)
-engine.add(
-    host_flag.data_ptr(),
-    address,
-    (fixture.entry(), address),
-    ids.data_ptr(),
-    weights.data_ptr(),
-    mapping.data_ptr(),
-    int(event.npu_event),
-    int(weight_ready.npu_event),
-    1,
-    1,
-    0,
-    8,
-    4,
-    planner,
-)
+engine.add(host_flag.data_ptr(), address, (fixture.entry(), address),
+           ids.data_ptr(), weights.data_ptr(), mapping.data_ptr(), int(event.npu_event), int(weight_ready.npu_event),
+           1, 1, 0, 8, 4, planner)
 print("GRAPH_INIT", flush=True)
 graph = torch.npu.NPUGraph()
 print("CAPTURE", flush=True)
@@ -55,7 +41,7 @@ with torch.npu.graph(graph):
     output.add_(1)
 try:
     for generation in range(1, 6):
-        print("REPLAY", generation, flush=True)
+        print("REPLAY",generation,flush=True)
         graph.replay()
         assert fixture.wait_holding_gil(task, generation), "Native task could not run while GIL was held"
         torch.npu.synchronize()
