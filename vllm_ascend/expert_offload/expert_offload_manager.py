@@ -1376,7 +1376,11 @@ class ExpertOffloadManager:
                 if w is None:
                     continue
                 source_format = torch_npu.get_npu_format(w)
-                if source_format == 29:
+                # torch_npu versions may report a numeric ACL format, a
+                # format name, or an enum. In particular, packed MXFP4 NZ
+                # can report FRACTAL_NZ_C0_16 rather than integer 29.
+                format_name = str(getattr(source_format, "name", source_format)).rsplit(".", 1)[-1]
+                if source_format == ACL_FORMAT_FRACTAL_NZ or format_name in ("FRACTAL_NZ", "FRACTAL_NZ_C0_16"):
                     # DeepSeek MXFP4 loaders also produce NZ before manager
                     # finalization, not only the native CPU backend. Recasting
                     # their packed storage is unnecessary and may fail with
@@ -1387,7 +1391,7 @@ class ExpertOffloadManager:
                 try:
                     d = torch_npu.npu_format_cast(
                         d.view(torch.uint8),
-                        29,
+                        ACL_FORMAT_FRACTAL_NZ,
                         customize_dtype=torch.float8_e4m3fn,
                         input_dtype=torch_npu.float4_e2m1fn_x2,
                     )

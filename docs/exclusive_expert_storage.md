@@ -79,7 +79,16 @@ Dependency-free orchestration tests:
 python tests/ut/expert_offload/test_exclusive_pool.py -v
 ```
 
-Hardware test for eager and graph-replayed swaps, including quant metadata:
+Small NPU startup regression without loading a checkpoint. It checks that
+resident MXFP4 slots already converted by the quantization loader retain
+their allocations, strides and format when the manager finalizes them.
+Both numeric format 29 and named `FRACTAL_NZ_C0_16` are recognized:
+
+```bash
+pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/test_exclusive_expert_graph.py::test_mxfp4_finalization_preserves_real_nz_slots
+```
+
+Hardware tests also cover eager and graph-replayed swaps, including quant metadata:
 
 ```bash
 pytest -v tests/e2e/nightly/single_node/ops/singlecard_ops/test_exclusive_expert_graph.py
@@ -89,5 +98,6 @@ Before deployment, compare the same quantized model with the option disabled
 and enabled in eager and graph modes. Alternate prompts to force repeated
 evictions and reloads; include multiple prefill/decode transitions. Compare
 outputs and live Host allocation bytes, measure startup peak separately, and
-profile both D2H and H2D. The hardware test uses plain byte tensors; actual
-NZ/MXFP4 model execution must additionally validate physical layout roundtrips.
+profile both D2H and H2D. The swap tests use plain byte tensors; the NZ startup
+test checks format preservation only. Actual NZ/MXFP4 model execution must
+additionally validate physical layout roundtrips.

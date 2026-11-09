@@ -6,6 +6,7 @@ importing vLLM/torch_npu. This checks orchestration, not accelerator kernels.
 
 import ast
 from contextlib import nullcontext
+from enum import Enum
 import importlib.util
 from pathlib import Path
 import sys
@@ -23,6 +24,7 @@ ExclusiveExpertPool = module.ExclusiveExpertPool
 
 
 def method(name, **namespace):
+    namespace.setdefault("ACL_FORMAT_FRACTAL_NZ", 29)
     tree = ast.parse((SOURCE / "expert_offload_manager.py").read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ExpertOffloadManager")
     function = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == name)
@@ -353,13 +355,22 @@ class ExclusivePoolTests(unittest.TestCase):
                 raise AssertionError("Already-NZ storage must be preserved verbatim")
 
         layer = SimpleNamespace(w13_weight=AlreadyNZ(), w2_weight=AlreadyNZ())
-        npu = SimpleNamespace(get_npu_format=Mock(return_value=29), npu_format_cast=Mock())
+        npu = SimpleNamespace(get_npu_format=Mock(), npu_format_cast=Mock())
         manager = SimpleNamespace(moe_layers=[layer], native_mxfp4_enabled=False,
                                   offload_config=SimpleNamespace(exclusive_expert_storage=True))
         convert = method("_cast_device_slots_to_mxfp4_nz", torch_npu=npu, _expert_weight=getattr)
-        for _ in range(2):
-            convert(manager)
-        self.assertEqual(npu.get_npu_format.call_count, 4)
+        class Format(Enum):
+            FRACTAL_NZ_C0_16 = "FRACTAL_NZ_C0_16"
+
+        # Plain Enum deliberately does not compare equal to integer 29.
+        for source_format in (29, "FRACTAL_NZ", "FRACTAL_NZ_C0_16",
+                              Format.FRACTAL_NZ_C0_16, "Format.FRACTAL_NZ_C0_16"):
+            with self.subTest(source_format=source_format):
+                npu.get_npu_format.reset_mock(return_value=True)
+                npu.get_npu_format.return_value = source_format
+                for _ in range(2):
+                    convert(manager)
+                self.assertEqual(npu.get_npu_format.call_count, 4)
         npu.npu_format_cast.assert_not_called()
 
     def test_mxfp4_mixed_layout_converts_only_base_format_weight(self):
@@ -392,6 +403,24 @@ class ExclusivePoolTests(unittest.TestCase):
             convert(manager)
         self.assertEqual(str(error.exception.__cause__), "ACL 361001")
         self.assertIs(base.data, original)
+
+    def test_mxfp4_other_named_formats_are_not_treated_as_nz_c0_16(self):
+        base = Mock(shape=(2, 32, 16), dtype="uint8")
+        npu = SimpleNamespace(get_npu_format=Mock(),
+                              npu_format_cast=Mock(side_effect=RuntimeError("cast failed")),
+                              float4_e2m1fn_x2="fp4")
+        manager = SimpleNamespace(moe_layers=[SimpleNamespace(w13_weight=base)],
+                                  offload_config=SimpleNamespace(exclusive_expert_storage=True))
+        convert = method("_cast_device_slots_to_mxfp4_nz", torch_npu=npu, _expert_weight=getattr,
+                         torch=SimpleNamespace(uint8="uint8", float8_e4m3fn="fp8"))
+        # Do not accept arbitrary FRACTAL_NZ_* names with different blocking.
+        for source_format in ("ND", "FRACTAL_NZ_C0_32", "UNKNOWN"):
+            with self.subTest(source_format=source_format):
+                npu.get_npu_format.return_value = source_format
+                npu.npu_format_cast.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, f"source_format={source_format}"):
+                    convert(manager)
+                npu.npu_format_cast.assert_called_once()
 
 
 if __name__ == "__main__":

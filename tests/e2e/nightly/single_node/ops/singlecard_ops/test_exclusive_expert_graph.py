@@ -9,6 +9,40 @@ import torch_npu
 from vllm_ascend.expert_offload.exclusive_pool import ExclusiveExpertPool
 from vllm_ascend.expert_offload.expert_offload_manager import ExpertOffloadManager
 from vllm_ascend.expert_offload.h2d_transfer import TorchCopyH2DTransport
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
+
+def test_mxfp4_finalization_preserves_real_nz_slots(monkeypatch):
+    """Check the installed torch_npu format representation without a checkpoint."""
+    torch.npu.set_device(0)
+    weights = []
+    for _ in range(2):
+        packed = torch.zeros((2, 128, 128), dtype=torch.uint8, device="npu")
+        nz = torch_npu.npu_format_cast(
+            packed, ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        ).transpose(1, 2)
+        weights.append(nz)
+    torch.npu.synchronize()
+    formats = [torch_npu.get_npu_format(w) for w in weights]
+    print(f"Resident MXFP4 formats: {formats!r}")
+    before = [(w.data_ptr(), w.stride(), w.untyped_storage().nbytes()) for w in weights]
+    layer = SimpleNamespace(w13_weight=weights[0], w2_weight=weights[1])
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.moe_layers = [layer]
+    manager.offload_config = SimpleNamespace(exclusive_expert_storage=True)
+
+    def unexpected_cast(*args, **kwargs):
+        raise AssertionError(f"Already-NZ resident slots must not be recast: {formats!r}")
+
+    monkeypatch.setattr(torch_npu, "npu_format_cast", unexpected_cast)
+    for _ in range(2):
+        manager._cast_device_slots_to_mxfp4_nz()
+    assert layer.w13_weight is weights[0]
+    assert layer.w2_weight is weights[1]
+    assert before == [(w.data_ptr(), w.stride(), w.untyped_storage().nbytes()) for w in weights]
+    assert formats == [torch_npu.get_npu_format(w) for w in weights]
 
 
 @pytest.mark.parametrize("capture", [False, True])
