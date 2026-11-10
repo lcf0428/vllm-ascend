@@ -29,11 +29,30 @@ expert bundles. One additional Host bundle per distinct layout is shared
 across layers as a rotating spare. A bundle includes w13, w2, and all stored
 scales, offsets and scale biases. Device parameter addresses remain fixed.
 
-Each miss performs D2H(victim -> spare), waits, performs H2D(incoming -> device
-slot), waits, and commits ownership. The incoming Host bundle becomes the
-next spare. There is no NPU staging and no extra Host-to-Host copy in decode.
+Each layer's misses form one transaction. It prepares all descriptors, submits
+ordered D2H(victim -> spare), H2D(incoming -> device slot) pairs on the same
+load stream, refreshes derived scales, and waits once before committing
+ownership. The incoming Host bundle becomes the next spare. There is no NPU
+staging and no extra Host-to-Host copy in decode.
 Slot buffers are allocated before graph capture. Runtime descriptors resolve
 the current Host owner; cached descriptors never retain old expert addresses.
+
+The batch validates unique device slots and incoming IDs; every incoming
+expert must be Host-owned at batch entry. For consecutive swaps A1/B1 and
+A2/B2, the queue is `D2H(A1 -> spare), H2D(B1 -> slot1),
+D2H(A2 -> old Host B1), H2D(B2 -> slot2)`. All fields of each direction are
+submitted before the next direction. Do not group all D2H ahead of H2D:
+that would overwrite B1 before it is read. Same-stream ordering preserves
+each victim before its device slot is overwritten, and consumes each incoming
+Host bundle before that allocation is reused as the next spare.
+
+The pool lock covers planning, submission, completion and ownership commit,
+including layers sharing an exchange spare. Preparation failures submit no
+work. Submission/completion failures poison the pool, attempt to drain queued
+work, and leave committed ownership maps unchanged; the worker must stop
+because physical contents may already have changed. Successful nonempty
+decode batches use one completion barrier instead of two per miss plus an
+outer barrier. The graph's mapping upload remains after the callback returns.
 
 Startup places experts directly: initial resident experts [0,K) go through the
 original NPU weight loader and receive no Host weight or quantization buffers.

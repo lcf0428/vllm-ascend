@@ -12,6 +12,8 @@ import importlib.util
 from pathlib import Path
 import sys
 import time
+import random
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -140,21 +142,196 @@ class ExclusivePoolTests(unittest.TestCase):
             return [task(t, self.device[slot][name], t.nbytes(), name=name)
                     for name, t in host_bundle.items()]
         def copy_batch(batch):
-            events.append("d2h" if hasattr(batch[0], "direction") else "h2d")
+            events.append("batch")
             for item in batch:
                 item.destination.copy_(item.source)
         manager = SimpleNamespace(
-            _exclusive_pool=self.pool, _build_expert_h2d_tasks=tasks,
+            _exclusive_pool=self.pool, _build_expert_h2d_tasks=tasks, load_stream=object(),
             _get_h2d_transport=lambda: SimpleNamespace(copy_batch=copy_batch),
             _synchronize_h2d=lambda: events.append("sync"),
             _refresh_expert_fp32_scale=lambda *args: events.append("refresh"))
-        swap = method("_exclusive_swap", H2DCopyTask=task, CopyDirection=SimpleNamespace(D2H="d2h"))
+        swap_batch = method("_exclusive_swap_batch", H2DCopyTask=task, CopyDirection=SimpleNamespace(D2H="d2h"),
+                            torch_npu=SimpleNamespace(npu=SimpleNamespace(stream=lambda _: nullcontext())))
+        manager._exclusive_swap_batch = lambda *args: swap_batch(manager, *args)
+        swap = method("_exclusive_swap")
         for eid in (2, 0, 4, 2):
             events.clear()
             swap(manager, object(), 0, 0, eid)
-            self.assertEqual(events, ["d2h", "sync", "h2d", "sync", "refresh"])
+            self.assertEqual(events, ["batch", "refresh", "sync"])
             for name, tensor in self.device[0].items():
                 self.assertEqual(tensor.value, bundle(eid)[name].value)
+
+    def test_batch_deferred_stream_preserves_bytes_over_random_swaps(self):
+        rng = random.Random(421)
+        self.pool = ExclusiveExpertPool()
+        self.pool.add_layer(0, [bundle(i) for i in range(12)], list(range(5)) + [-1] * 7)
+        self.device = {slot: bundle(slot) for slot in range(5)}
+        original_addresses = {id(t) for b in list(self.pool.host.values()) + list(self.pool.spares.values())
+                              for t in b.values()}
+        for _ in range(200):
+            slots = rng.sample(list(range(5)), rng.randint(1, 5))
+            incoming = rng.sample([eid for layer, eid in self.pool.host if layer == 0], len(slots))
+            loads = list(zip(slots, incoming))
+            original_host, original_resident = dict(self.pool.host), dict(self.pool.resident)
+            queue, syncs = [], []
+
+            def prepare(plan):
+                self.assertEqual(self.pool.host, original_host)
+                for previous, current in zip(plan, plan[1:]):
+                    self.assertIs(current.destination, previous.source)
+                tasks = []
+                for step in plan:
+                    for name in step.destination:
+                        tasks.append((step.destination[name], self.device[step.slot][name]))
+                    for name in step.source:
+                        tasks.append((self.device[step.slot][name], step.source[name]))
+                return tasks
+
+            def synchronize():
+                syncs.append(1)
+                self.assertEqual(self.pool.host, original_host)
+                self.assertEqual(self.pool.resident, original_resident)
+                # Read the live source only now, after ALL tasks were queued.
+                # Grouping all D2H before H2D would corrupt the second source.
+                for destination, source in queue:
+                    destination.copy_(source)
+
+            self.pool.swap_batch(0, loads, prepare, queue.extend, synchronize)
+            self.assertEqual(syncs, [1])
+            for slot, eid in self.pool.resident.items():
+                for name, tensor in self.device[slot[1]].items():
+                    self.assertEqual(tensor.value, bundle(eid)[name].value)
+            for (_, eid), host in self.pool.host.items():
+                for name, tensor in host.items():
+                    self.assertEqual(tensor.value, bundle(eid)[name].value)
+            self.assertEqual(len(self.pool.host), 7)
+            self.assertEqual(original_addresses, {id(t) for b in list(self.pool.host.values())
+                                                  + list(self.pool.spares.values()) for t in b.values()})
+
+    def test_batch_shared_spare_is_locked_until_completion_across_layers(self):
+        self.pool.add_layer(1, [bundle(i) for i in range(6)], [0, 1, -1, -1, -1, -1])
+        first_waiting, release, second_started, second_prepared = [threading.Event() for _ in range(4)]
+        errors = []
+        def sync_first():
+            first_waiting.set()
+            if not release.wait(5):
+                raise TimeoutError("completion gate")
+        def run(layer):
+            try:
+                if layer == 1:
+                    second_started.set()
+                self.pool.swap_batch(layer, [(0, 2)],
+                                    lambda plan: second_prepared.set() if layer == 1 else plan,
+                                    lambda prepared: None, sync_first if layer == 0 else lambda: None)
+            except BaseException as error:
+                errors.append(error)
+        first = threading.Thread(target=run, args=(0,))
+        second = threading.Thread(target=run, args=(1,))
+        first.start()
+        try:
+            self.assertTrue(first_waiting.wait(5))
+            second.start()
+            self.assertTrue(second_started.wait(5))
+            self.assertFalse(second_prepared.wait(0.05))
+        finally:
+            release.set()
+            first.join(5)
+            if second.ident is not None:
+                second.join(5)
+        self.assertFalse(errors)
+        self.assertTrue(second_prepared.is_set())
+        self.assertFalse(first.is_alive() or second.is_alive())
+
+    def test_batch_rejects_invalid_plan_before_any_submission(self):
+        for loads in ([(0, 2), (0, 3)], [(0, 2), (1, 2)], [(0, 1)], [(9, 2)], [(0, 99)]):
+            prepare, enqueue, sync = Mock(), Mock(), Mock()
+            with self.subTest(loads=loads), self.assertRaises((ValueError, KeyError)):
+                self.pool.swap_batch(0, loads, prepare, enqueue, sync)
+            prepare.assert_not_called()
+            enqueue.assert_not_called()
+            sync.assert_not_called()
+            self.assertFalse(self.pool.failed)
+
+    def test_batch_preparation_failure_is_nondestructive(self):
+        enqueue, sync = Mock(), Mock()
+        with self.assertRaisesRegex(RuntimeError, "descriptor"):
+            self.pool.swap_batch(0, [(0, 2), (1, 3)], Mock(side_effect=RuntimeError("descriptor")), enqueue, sync)
+        enqueue.assert_not_called()
+        sync.assert_not_called()
+        self.assertFalse(self.pool.failed)
+        self.assertEqual(self.pool.resident, {(0, 0): 0, (0, 1): 1})
+
+    def test_batch_failure_at_every_transfer_boundary_never_commits(self):
+        for failing_index in range(24):
+            pool = ExclusiveExpertPool()
+            pool.add_layer(0, [bundle(i) for i in range(6)], [0, 1, -1, -1, -1, -1])
+            device = {0: bundle(0), 1: bundle(1)}
+            original_host, original_resident, original_spares = dict(pool.host), dict(pool.resident), dict(pool.spares)
+            queue = []
+
+            def prepare(plan):
+                return [(dst[name], src[name]) for step in plan
+                        for dst, src in ((step.destination, device[step.slot]), (device[step.slot], step.source))
+                        for name in dst]
+
+            def enqueue(tasks):
+                for index, task in enumerate(tasks):
+                    if index == failing_index:
+                        raise RuntimeError("submit failed")
+                    queue.append(task)
+
+            def sync():
+                for dst, src in queue:
+                    dst.copy_(src)
+                queue.clear()
+
+            with self.subTest(failing_index=failing_index), self.assertRaisesRegex(RuntimeError, "submit failed"):
+                pool.swap_batch(0, [(0, 2), (1, 3)], prepare, enqueue, sync)
+            self.assertFalse(queue)
+            self.assertTrue(pool.failed)
+            self.assertEqual(pool.host, original_host)
+            self.assertEqual(pool.resident, original_resident)
+            self.assertEqual(pool.spares, original_spares)
+            with self.assertRaisesRegex(RuntimeError, "poisoned"):
+                pool.swap_batch(0, [], Mock(), Mock(), Mock())
+
+    def test_batch_completion_failure_poisoning_and_empty_batch(self):
+        enqueue, sync = Mock(), Mock(side_effect=RuntimeError("completion failed"))
+        self.pool.swap_batch(0, [], Mock(), enqueue, sync)
+        enqueue.assert_not_called()
+        sync.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "completion failed"):
+            self.pool.swap_batch(0, [(0, 2)], lambda plan: plan, enqueue, sync)
+        self.assertTrue(self.pool.failed)
+        self.assertEqual(self.pool.resident, {(0, 0): 0, (0, 1): 1})
+
+    def test_manager_batches_two_experts_with_one_completion_barrier(self):
+        pending, events = [], []
+        def task(source, destination, nbytes, **kwargs):
+            return SimpleNamespace(source=source, destination=destination, nbytes=nbytes, **kwargs)
+        def build(layer, idx, eid, slot, host_bundle=None):
+            events.append("build")
+            return [task(t, self.device[slot][name], t.nbytes(), name=name) for name, t in host_bundle.items()]
+        def enqueue(tasks):
+            events.append("enqueue")
+            pending.extend(tasks)
+        def synchronize():
+            events.append("sync")
+            self.assertEqual(self.pool.resident, {(0, 0): 0, (0, 1): 1})
+            for t in pending:
+                t.destination.copy_(t.source)
+        manager = SimpleNamespace(
+            _exclusive_pool=self.pool, load_stream=object(), _build_expert_h2d_tasks=build,
+            _get_h2d_transport=lambda: SimpleNamespace(copy_batch=enqueue), _synchronize_h2d=synchronize,
+            _refresh_expert_fp32_scale=lambda *args: events.append("scale"))
+        batch = method("_exclusive_swap_batch", H2DCopyTask=task, CopyDirection=SimpleNamespace(D2H="d2h"),
+                       torch_npu=SimpleNamespace(npu=SimpleNamespace(stream=lambda _: nullcontext())))
+        manager._exclusive_swap_batch = lambda *args: batch(manager, *args)
+        method("_load_expert_weights_into_slots")(manager, object(), 0, [(0, 2), (1, 3)])
+        self.assertEqual(events, ["build"] * 4 + ["enqueue", "scale", "scale", "sync"])
+        for slot, eid in ((0, 2), (1, 3)):
+            for name, t in self.device[slot].items():
+                self.assertEqual(t.value, bundle(eid)[name].value)
 
     def test_prefill_reads_residents_from_device_and_misses_from_host(self):
         manager = SimpleNamespace(

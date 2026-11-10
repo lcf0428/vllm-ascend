@@ -1187,19 +1187,37 @@ class ExpertOffloadManager:
                     "direct_placement=true conversion_batch_experts=1", host_bytes, len(pool.spares))
 
     def _exclusive_swap(self, layer, layer_idx, slot, eid):
-        def transfer(bundle, download):
-            tasks = self._build_expert_h2d_tasks(layer, layer_idx, eid, slot, host_bundle=bundle)
-            if download:
-                tasks = [H2DCopyTask(t.destination, t.source, t.nbytes,
-                                     name="exclusive-evict-" + t.name, direction=CopyDirection.D2H)
-                         for t in tasks]
-            self._get_h2d_transport().copy_batch(tasks)
-            self._synchronize_h2d()
+        self._exclusive_swap_batch(layer, layer_idx, [(slot, eid)])
 
-        self._exclusive_pool.swap(layer_idx, slot, eid,
-                                  lambda bundle: transfer(bundle, True),
-                                  lambda bundle: transfer(bundle, False))
-        self._refresh_expert_fp32_scale(layer, slot)
+    def _exclusive_swap_batch(self, layer, layer_idx, loads):
+        def prepare(plan):
+            tasks = []
+            for step in plan:
+                reverse = self._build_expert_h2d_tasks(
+                    layer, layer_idx, step.incoming, step.slot, host_bundle=step.destination
+                )
+                tasks.extend(H2DCopyTask(t.destination, t.source, t.nbytes,
+                                         name="exclusive-evict-" + t.name, direction=CopyDirection.D2H)
+                             for t in reverse)
+                tasks.extend(self._build_expert_h2d_tasks(
+                    layer, layer_idx, step.incoming, step.slot, host_bundle=step.source
+                ))
+            return tasks, tuple(step.slot for step in plan)
+
+        def enqueue(prepared):
+            tasks, slots = prepared
+            # Do not group by direction: the next D2H may reuse the previous
+            # H2D source. copy_batch must preserve the complete field order.
+            self._get_h2d_transport().copy_batch(tasks)
+            for slot in slots:
+                self._refresh_expert_fp32_scale(layer, slot)
+
+        # Explicitly select the same stream for both directions, scale kernels
+        # and the completion barrier, including eager/hot-preload callers.
+        with torch_npu.npu.stream(self.load_stream):
+            self._exclusive_pool.swap_batch(
+                layer_idx, loads, prepare, enqueue, self._synchronize_h2d
+            )
 
     def process_weights_after_loading(self):
         """Convert resident CPU expert buffers to the on-device weight format.
@@ -3931,8 +3949,7 @@ class ExpertOffloadManager:
     def _load_expert_weights_into_slots(self, layer, layer_idx, loads):
         """Batch H2D-copy ``(slot, eid)`` loads, then refresh derived data."""
         if getattr(self, "_exclusive_pool", None) is not None:
-            for slot, eid in loads:
-                self._exclusive_swap(layer, layer_idx, slot, eid)
+            self._exclusive_swap_batch(layer, layer_idx, loads)
             return
         trace = self._prefetch_trace
         trace.mark(CpuPrefetchPhase.DESCRIPTOR_BEGIN)
@@ -4488,7 +4505,11 @@ class ExpertOffloadManager:
                 chosen_load_stream.record_event(dma_done)
                 trace.mark(CpuPrefetchPhase.H2D_SYNC_END)
                 return dma_done
-            self._synchronize_h2d(stream=chosen_load_stream)
+            # Exclusive nonempty batches already completed all copies and
+            # scale refreshes before committing ownership. The remaining
+            # bookkeeping above is CPU-only; retain the barrier on other paths.
+            if getattr(self, "_exclusive_pool", None) is None or not planned_loads:
+                self._synchronize_h2d(stream=chosen_load_stream)
             trace.mark(CpuPrefetchPhase.H2D_SYNC_END)
         trace.mark(CpuPrefetchPhase.LOAD_STREAM_EXIT)
 

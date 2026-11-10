@@ -54,24 +54,26 @@ def test_exclusive_swap_repeated_routes(capture):
     manager.h2d_transport = TorchCopyH2DTransport()
     manager._exclusive_pool = ExclusiveExpertPool()
     fields = ("w13", "w2", "w13_weight_scale", "w2_weight_scale")
-    bundles = [None] + [{name: torch.full((32, 32), eid + j, dtype=torch.uint8, pin_memory=True)
-                        for j, name in enumerate(fields)} for eid in range(1, 4)]
+    bundles = [None, None] + [{name: torch.full((32, 32), eid + j, dtype=torch.uint8, pin_memory=True)
+                              for j, name in enumerate(fields)} for eid in range(2, 6)]
+    def initial(value):
+        return torch.stack([torch.full((32, 32), value + slot, dtype=torch.uint8, device="npu")
+                            for slot in range(2)])
     layer = SimpleNamespace(
-        w13_weight=torch.full((1, 32, 32), 0, dtype=torch.uint8, device="npu"),
-        w2_weight=torch.full((1, 32, 32), 1, dtype=torch.uint8, device="npu"),
-        w13_weight_scale=torch.full((1, 32, 32), 2, dtype=torch.uint8, device="npu"),
-        w2_weight_scale=torch.full((1, 32, 32), 3, dtype=torch.uint8, device="npu"))
+        w13_weight=initial(0), w2_weight=initial(1),
+        w13_weight_scale=initial(2), w2_weight_scale=initial(3),
+        w13_weight_scale_fp32=initial(2).float())
     manager.w13_expert_size_bytes = manager.w2_expert_size_bytes = 1024
-    manager.scale_cpu_buffers = {name: [[None] * 4] for name in fields[2:]}
+    manager.scale_cpu_buffers = {name: [[None] * 6] for name in fields[2:]}
     manager.offset_cpu_buffers = {}
     manager.scale_bias_cpu_buffers = {}
     manager._exclusive_pool.add_layer(
-        0, bundles, [0, -1, -1, -1],
+        0, bundles, [0, 1, -1, -1, -1, -1],
         allocate_spare=lambda template: {name: torch.empty_like(t, pin_memory=True)
                                          for name, t in template.items()})
     del bundles
-    route = torch.tensor([1], dtype=torch.int32, device="npu")
-    route_h = torch.empty(1, dtype=torch.int32, pin_memory=True)
+    route = torch.tensor([2, 3], dtype=torch.int32, device="npu")
+    route_h = torch.empty(2, dtype=torch.int32, pin_memory=True)
     observed = [torch.empty_like(getattr(layer, name if "scale" in name else name + "_weight"))
                 for name in fields]
     weights = [getattr(layer, name if "scale" in name else name + "_weight") for name in fields]
@@ -80,10 +82,9 @@ def test_exclusive_swap_repeated_routes(capture):
 
     def exchange(_):
         try:
-            eid = int(route_h[0])
-            if manager._exclusive_pool.resident[0, 0] != eid:
-                with torch_npu.npu.stream(manager.load_stream):
-                    manager._exclusive_swap(layer, 0, 0, eid)
+            loads = [(slot, int(eid)) for slot, eid in enumerate(route_h.tolist())
+                     if manager._exclusive_pool.resident[0, slot] != int(eid)]
+            manager._load_expert_weights_into_slots(layer, 0, loads)
         except BaseException as error:
             errors.append(error)
 
@@ -104,8 +105,8 @@ def test_exclusive_swap_repeated_routes(capture):
     if capture:
         with torch.npu.graph(graph, stream=stream):
             record()
-    for eid in [1, 2, 0, 3, 2, 1, 0] * 3:
-        route.fill_(eid)
+    for ids in [(2, 3), (2, 3), (0, 1), (4, 5), (2, 3), (4, 3), (0, 5)] * 3:
+        route.copy_(torch.tensor(ids, dtype=torch.int32, device="npu"))
         if capture:
             graph.replay()
         else:
@@ -113,7 +114,13 @@ def test_exclusive_swap_repeated_routes(capture):
         torch.npu.synchronize()
         assert not errors, errors
         for j, output in enumerate(observed):
-            torch.testing.assert_close(output.cpu(), torch.full_like(output, eid + j, device="cpu"))
-        assert len(manager._exclusive_pool.host) == 3
+            expected = torch.stack([torch.full((32, 32), eid + j, dtype=torch.uint8) for eid in ids])
+            torch.testing.assert_close(output.cpu(), expected)
+        for (_, eid), host in manager._exclusive_pool.host.items():
+            for j, name in enumerate(fields):
+                torch.testing.assert_close(host[name], torch.full_like(host[name], eid + j))
+        torch.testing.assert_close(layer.w13_weight_scale_fp32.cpu(),
+                                   torch.stack([torch.full((32, 32), float(eid + 2)) for eid in ids]))
+        assert len(manager._exclusive_pool.host) == 4
         assert len(manager._exclusive_pool.spares) == 1
         assert addresses == [value.data_ptr() for value in weights]
