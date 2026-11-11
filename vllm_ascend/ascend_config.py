@@ -1972,6 +1972,13 @@ class ExpertOffloadConfig:
         # Size is in MiB; the arena is released before NZ conversion/capture.
         "exclusive_load_pool_enabled": False,
         "exclusive_load_pool_size_mb": 1024,
+        # Runtime Host resident-copy cache; distinct from checkpoint staging.
+        "exclusive_host_prefetch_enabled": False,
+        # Independent of expert_prefetch_num/tokens used by NPU prefetch.
+        "exclusive_host_prefetch_num": 2,
+        "exclusive_host_prefetch_tokens": 1,
+        "exclusive_host_cache_size_mb": 1024,
+        "exclusive_host_prefetch_d2h": False,
         "num_device_experts": 32,
         "num_device_layers": 2,
         "expert_map_path": None,
@@ -2046,6 +2053,22 @@ class ExpertOffloadConfig:
         exclusive = self.config["exclusive_expert_storage"]
         if not isinstance(exclusive, bool):
             raise TypeError("exclusive_expert_storage must be a boolean")
+        host_prefetch = self.config["exclusive_host_prefetch_enabled"]
+        early_d2h = self.config["exclusive_host_prefetch_d2h"]
+        if not isinstance(host_prefetch, bool) or not isinstance(early_d2h, bool):
+            raise TypeError("exclusive_host_prefetch_enabled and exclusive_host_prefetch_d2h must be booleans")
+        for key in ("exclusive_host_prefetch_num", "exclusive_host_prefetch_tokens"):
+            if type(self.config[key]) is not int:
+                raise TypeError(f"{key} must be a positive integer")
+            if self.config[key] <= 0:
+                raise ValueError(f"{key} must be a positive integer")
+        cache_mb = self.config["exclusive_host_cache_size_mb"]
+        if type(cache_mb) is not int or cache_mb <= 0:
+            raise ValueError("exclusive_host_cache_size_mb must be a positive integer (MiB)")
+        if host_prefetch and not exclusive:
+            raise ValueError("exclusive_host_prefetch_enabled requires exclusive_expert_storage=True")
+        if early_d2h and not host_prefetch:
+            raise ValueError("exclusive_host_prefetch_d2h requires exclusive_host_prefetch_enabled=True")
         load_pool = self.config["exclusive_load_pool_enabled"]
         if not isinstance(load_pool, bool):
             raise TypeError("exclusive_load_pool_enabled must be a boolean")

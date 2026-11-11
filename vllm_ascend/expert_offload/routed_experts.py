@@ -185,6 +185,11 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
         and mgr._prefill_initialized
         and (layer.enable_multi_card or not mgr._skip_prefill)
     )
+    if not use_prefill and getattr(mgr.offload_config, "exclusive_host_prefetch_enabled", False):
+        # Submit the Host backup callback before current-layer GMM so its
+        # asynchronous D2H on load_stream can overlap that computation.
+        mgr.trigger_next_layer_prefetch(layer, hidden_states)
+        prefetch_staged = True
     if counter_sample is not None:
         counter_weights = topk_weights
         if hybrid_plan is not None:

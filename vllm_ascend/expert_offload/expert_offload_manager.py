@@ -115,6 +115,7 @@ class ExpertOffloadManager:
 
         self.offload_config = get_ascend_config().expert_offload_config
         self._exclusive_pool = None
+        self._exclusive_prediction_buffers = {}
         if self.offload_config.exclusive_expert_storage:
             parallel = vllm_config.parallel_config
             if any(size != 1 for size in (
@@ -781,7 +782,8 @@ class ExpertOffloadManager:
             quant_bytes = self._cpu_tensor_storage_bytes([owner.tensors[3:] for owner in self._native_owners.values()])
         pool = getattr(self, "_exclusive_pool", None)
         if pool is not None:
-            bundles = list(pool.host.values()) + list(pool.spares.values())
+            bundles = (list(pool.host.values()) + list(pool.spares.values()) + list(pool.shadows.values())
+                       + [b for buffers in pool.shadow_free.values() for b in buffers])
             weights_bytes = self._cpu_tensor_storage_bytes(
                 [[bundle["w13"], bundle["w2"]] for bundle in bundles])
             quant_bytes = self._cpu_tensor_storage_bytes(
@@ -1041,6 +1043,15 @@ class ExpertOffloadManager:
         t_hot = time.perf_counter()
         self.create_prefill_pool()
         t6 = time.perf_counter()
+        if self.offload_config.exclusive_host_prefetch_enabled:
+            self.register_gate_weights(model)
+            # Separate pinned prediction buffers: never reuse the reactive
+            # route/map staging buffers while another callback consumes them.
+            for idx in range(1, num_moe_layers):
+                self._exclusive_prediction_buffers[idx] = (
+                    torch.empty((self.offload_threshold, self.topk), dtype=torch.int32, pin_memory=True),
+                    torch.empty((self.offload_threshold, self.topk), dtype=torch.float32, pin_memory=True),
+                )
         if self.offload_config.expert_prefetch_enabled:
             self.register_gate_weights(model)
             # Pinned staging buffer for graph-mode prefetch: trigger_next_
@@ -1181,8 +1192,13 @@ class ExpertOffloadManager:
             pool.add_layer(idx, bundles, layer.log2phy.cpu().tolist(), allocate_spare=allocate_spare)
             for values in fields.values():
                 values[:] = [None] * len(values)
+        if self.offload_config.exclusive_host_prefetch_enabled:
+            pool.configure_shadow_cache(self.offload_config.exclusive_host_cache_size_mb * 1024 * 1024,
+                                        allocate_spare)
+            logger.info("[EXCLUSIVE-HOST-PREFETCH] cache_bytes=%d early_d2h=%s",
+                        pool.shadow_capacity_bytes, self.offload_config.exclusive_host_prefetch_d2h)
         self._exclusive_pool = pool
-        host_bytes = self._cpu_tensor_storage_bytes((pool.host, pool.spares))
+        host_bytes = self._cpu_tensor_storage_bytes((pool.host, pool.spares, pool.shadow_free))
         logger.info("[EXPERT-EXCLUSIVE] host_bytes=%d exchange_layouts=%d "
                     "direct_placement=true conversion_batch_experts=1", host_bytes, len(pool.spares))
 
@@ -1193,12 +1209,13 @@ class ExpertOffloadManager:
         def prepare(plan):
             tasks = []
             for step in plan:
-                reverse = self._build_expert_h2d_tasks(
-                    layer, layer_idx, step.incoming, step.slot, host_bundle=step.destination
-                )
-                tasks.extend(H2DCopyTask(t.destination, t.source, t.nbytes,
-                                         name="exclusive-evict-" + t.name, direction=CopyDirection.D2H)
-                             for t in reverse)
+                if step.download:
+                    reverse = self._build_expert_h2d_tasks(
+                        layer, layer_idx, step.incoming, step.slot, host_bundle=step.destination
+                    )
+                    tasks.extend(H2DCopyTask(t.destination, t.source, t.nbytes,
+                                             name="exclusive-evict-" + t.name, direction=CopyDirection.D2H)
+                                 for t in reverse)
                 tasks.extend(self._build_expert_h2d_tasks(
                     layer, layer_idx, step.incoming, step.slot, host_bundle=step.source
                 ))
@@ -3825,6 +3842,10 @@ class ExpertOffloadManager:
         if transport is not None:
             transport.synchronize(self.load_stream)
             transport.close()
+        pool = getattr(self, "_exclusive_pool", None)
+        if pool is not None and pool.shadow_capacity_bytes:
+            logger.info("[EXCLUSIVE-HOST-CACHE] final capacity_bytes=%d counters=%s",
+                        pool.shadow_capacity_bytes, pool.shadow_stats)
         # Cached views retain backing tensors until all worker DMA is retired.
         getattr(self, "_expert_h2d_views", {}).clear()
         getattr(self, "_retired_expert_h2d_views", []).clear()
@@ -4508,7 +4529,11 @@ class ExpertOffloadManager:
             # Exclusive nonempty batches already completed all copies and
             # scale refreshes before committing ownership. The remaining
             # bookkeeping above is CPU-only; retain the barrier on other paths.
-            if getattr(self, "_exclusive_pool", None) is None or not planned_loads:
+            # With Host prefetch, an all-hit layer only READS its device
+            # weights. Its pending backup reads may overlap GMM safely; do
+            # not stall computation on speculative D2H that is not needed.
+            if (getattr(self, "_exclusive_pool", None) is None
+                    or (not planned_loads and not self.offload_config.exclusive_host_prefetch_enabled)):
                 self._synchronize_h2d(stream=chosen_load_stream)
             trace.mark(CpuPrefetchPhase.H2D_SYNC_END)
         trace.mark(CpuPrefetchPhase.LOAD_STREAM_EXIT)
@@ -4613,10 +4638,99 @@ class ExpertOffloadManager:
                     )
             self._synchronize_h2d()
 
+    def _trigger_exclusive_host_prefetch(self, layer, hidden_states):
+        if (hidden_states is None or self._skip_prefill or self._exclusive_pool is None
+                or hidden_states.shape[0] > self.offload_threshold):
+            return
+        layer_idx = self.moe_layers.index(layer)
+        target_idx = layer_idx + 1
+        if target_idx not in self._exclusive_prediction_buffers:
+            return
+        predicted = self.predict_next_layer_experts_npu(
+            layer_idx, hidden_states,
+            prediction_tokens=self.offload_config.exclusive_host_prefetch_tokens,
+        )
+        if predicted is None:
+            return
+        weights, ids = predicted
+        rows, width = ids.shape
+        ids_buffer, weights_buffer = self._exclusive_prediction_buffers[target_idx]
+        ids_h = ids_buffer[:rows, :width]
+        weights_h = weights_buffer[:rows, :width]
+        ids_h.copy_(ids.to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
+        weights_h.copy_(weights.to(torch.float32), non_blocking=_EXTRA_CTX.capturing)
+        args = (target_idx, ids_h, weights_h)
+        if _EXTRA_CTX.capturing:
+            stream = torch_npu.npu.current_stream()
+            subscribed = get_subscribed_compute_streams()
+            if stream not in subscribed:
+                torch_npu.npu._subscribe_report(stream)
+                subscribed.add(stream)
+            torch_npu.npu._launch_host_func(stream, self._exclusive_host_prefetch_callback, args)
+        else:
+            self._exclusive_host_prefetch(args)
+
+    def _select_exclusive_prefetch_victims(self, layer_idx, ids_h, weights_h):
+        scores = {}
+        for ids, weights in zip(ids_h.tolist(), weights_h.tolist()):
+            for eid, weight in zip(ids, weights):
+                if 0 <= eid < self.num_total_experts:
+                    scores[eid] = max(scores.get(eid, float("-inf")), float(weight))
+        owners = {slot: eid for (idx, slot), eid in self._exclusive_pool.resident.items() if idx == layer_idx}
+        resident = set(owners.values())
+        candidate_limit = min(self.topk, self.offload_config.exclusive_host_prefetch_num)
+        predicted_misses = sorted((eid for eid in scores if eid not in resident),
+                                  key=lambda eid: (-scores[eid], eid))[:candidate_limit]
+        if self.cache_policy is not None:
+            return self.cache_policy.choose_victims(layer_idx, owners, protected=set(scores),
+                                                   count=len(predicted_misses))
+        # Match the reactive path's reverse physical-slot preference while
+        # protecting every predicted resident, not just the capped misses.
+        return [eid for slot, eid in sorted(owners.items(), reverse=True)
+                if eid not in scores][:len(predicted_misses)]
+
+    def _exclusive_host_prefetch(self, args):
+        layer_idx, ids_h, weights_h = args
+        pool = self._exclusive_pool
+        layer = self.moe_layers[layer_idx]
+        def prepare(plan):
+            tasks = []
+            for slot, eid, buffer in plan:
+                reverse = self._build_expert_h2d_tasks(layer, layer_idx, eid, slot, host_bundle=buffer)
+                tasks.extend(H2DCopyTask(t.destination, t.source, t.nbytes,
+                                         name="exclusive-backup-" + t.name, direction=CopyDirection.D2H)
+                             for t in reverse)
+            return tasks
+        try:
+            with pool.lock, torch.inference_mode(), torch_npu.npu.stream(self.load_stream):
+                victims = self._select_exclusive_prefetch_victims(layer_idx, ids_h, weights_h)
+                pool.prefetch_backups(
+                    layer_idx, victims, self.offload_config.exclusive_host_prefetch_d2h,
+                    prepare, self._get_h2d_transport().copy_batch,
+                )
+                interval = max(1, self.offload_config.cache_stats_log_interval)
+                if pool.shadow_stats["predictions"] % interval == 0:
+                    logger.info("[EXCLUSIVE-HOST-CACHE] capacity_bytes=%d counters=%s",
+                                pool.shadow_capacity_bytes, pool.shadow_stats)
+                # Deliberately no synchronize: next-layer swaps use this same
+                # stream, so its backup reads precede any slot overwrite.
+        except BaseException:
+            self._synchronize_h2d()
+            raise
+
+    def _exclusive_host_prefetch_callback(self, args):
+        try:
+            self._exclusive_host_prefetch(args)
+        except BaseException:
+            logger.exception("[EXCLUSIVE-HOST-PREFETCH] callback failed; stopping worker")
+            os._exit(1)
+
     def predict_next_layer_experts_npu(
         self,
         layer_idx: int,
         hidden_states: torch.Tensor,
+        *,
+        prediction_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Predict which experts layer layer_idx+1 will need, on NPU.
 
@@ -4627,18 +4741,20 @@ class ExpertOffloadManager:
         - Hash-routed layers (first num_hash_layers): experts come from the
           tid2eid table indexed by token id (deterministic, 100% accurate).
         - Learned layers (the rest): softmax + topk on the gate logits of the
-          first `expert_prefetch_tokens` token rows.
+          first `prediction_tokens` token rows.
 
         Args:
             layer_idx: Current layer index.
             hidden_states: [num_tokens, hidden_dim] NPU tensor.
+            prediction_tokens: Token-row limit. Defaults to the legacy NPU
+                prefetch limit; Host prefetch supplies its independent limit.
 
         Returns:
             (topk_weights, topk_ids), both [n_tok, topk] NPU tensors where
-            n_tok = min(expert_prefetch_tokens, forward rows), or None if
-            prediction is not possible. CHANGE: was "[1, topk], first token
-            only" — that stopped being true when expert_prefetch_tokens landed.
+            n_tok is bounded by the token-row limit and available input rows,
+            or None if prediction is not possible.
         """
+        token_limit = self.prefetch_tokens if prediction_tokens is None else prediction_tokens
         next_idx = layer_idx + 1
         if next_idx >= len(self.moe_layers):
             return None  # last layer — nothing to prefetch
@@ -4646,7 +4762,7 @@ class ExpertOffloadManager:
         if next_idx >= len(self._gate_weights_npu):
             return None
         gate_w = self._gate_weights_npu[next_idx]
-        if gate_w is None:
+        if gate_w is None and getattr(getattr(self.moe_layers[next_idx], "gate", None), "tid2eid", None) is None:
             return None
 
         # Hash-routed layers (the first num_hash_layers in DeepSeek-V4):
@@ -4663,7 +4779,7 @@ class ExpertOffloadManager:
                 return None
             # n rows, was input_ids[:1]. min() against both the hidden
             # rows and the context's id count: they agree on the decode path
-            n_tok = min(self.prefetch_tokens, hidden_states.shape[0], input_ids.shape[0])
+            n_tok = min(token_limit, hidden_states.shape[0], input_ids.shape[0])
             if n_tok < 1:
                 return None
             # [n_tok] on the tid2eid device -> index_select -> [n_tok, topk] int32.
@@ -4698,7 +4814,7 @@ class ExpertOffloadManager:
         # num_tokens <= offload_threshold.
         # Shape is fixed per captured graph, so this stays capture-safe.
         # On-device prediction: [n_tok, hidden_dim] x [n_experts, hidden_dim]
-        n_tok = min(self.prefetch_tokens, hidden_states.shape[0])
+        n_tok = min(token_limit, hidden_states.shape[0])
         router_logits = F.linear(hidden_states[:n_tok].float(), gate_w)
         probs = router_logits.softmax(dim=-1)
         topk_weights, topk_ids = probs.topk(self.topk, dim=-1)
@@ -4732,6 +4848,9 @@ class ExpertOffloadManager:
         of the tuple _stage_predicted_topk returns, and they are unpacked
         inside _dispatch_prefetch.
         """
+        if getattr(self.offload_config, "exclusive_host_prefetch_enabled", False):
+            self._trigger_exclusive_host_prefetch(layer, hidden_states)
+            return
         if not self.offload_config.expert_prefetch_enabled:
             return
         if not getattr(getattr(self.offload_config, "cpu_moe", None), "enabled", False):

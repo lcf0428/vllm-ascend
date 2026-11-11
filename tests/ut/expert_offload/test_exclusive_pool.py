@@ -377,8 +377,43 @@ class ExclusivePoolTests(unittest.TestCase):
         self.assertFalse(config_type({}).exclusive_expert_storage)
         self.assertFalse(config_type({}).exclusive_load_pool_enabled)
         self.assertEqual(config_type({}).exclusive_load_pool_size_mb, 1024)
+        self.assertFalse(config_type({}).exclusive_host_prefetch_enabled)
+        self.assertFalse(config_type({}).exclusive_host_prefetch_d2h)
+        self.assertEqual(config_type({}).exclusive_host_prefetch_num, 2)
+        self.assertEqual(config_type({}).exclusive_host_prefetch_tokens, 1)
         valid = {"expert_offload": True, "exclusive_expert_storage": True}
         self.assertTrue(config_type(valid).prefill_delta_load)
+        host_config = config_type(valid | {"exclusive_host_prefetch_enabled": True,
+                                          "exclusive_host_prefetch_d2h": True,
+                                          "exclusive_host_cache_size_mb": 512})
+        self.assertEqual(host_config.exclusive_host_cache_size_mb, 512)
+        self.assertFalse(host_config.expert_prefetch_enabled)
+        independent = config_type(valid | {"exclusive_host_prefetch_enabled": True,
+                                           "exclusive_host_prefetch_num": 3,
+                                           "exclusive_host_prefetch_tokens": 4,
+                                           "expert_prefetch_num": 7, "expert_prefetch_tokens": 8})
+        self.assertEqual(independent.exclusive_host_prefetch_num, 3)
+        self.assertEqual(independent.exclusive_host_prefetch_tokens, 4)
+        self.assertEqual(independent.expert_prefetch_num, 7)
+        self.assertEqual(independent.expert_prefetch_tokens, 8)
+        legacy_only = config_type(valid | {"expert_prefetch_num": 7, "expert_prefetch_tokens": 8})
+        self.assertEqual(legacy_only.exclusive_host_prefetch_num, 2)
+        self.assertEqual(legacy_only.exclusive_host_prefetch_tokens, 1)
+        for key in ("exclusive_host_prefetch_num", "exclusive_host_prefetch_tokens"):
+            for value in (True, False, "2", 1.5, None):
+                with self.subTest(key=key, value=value), self.assertRaises(TypeError):
+                    config_type(valid | {key: value})
+            for value in (0, -1):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    config_type(valid | {key: value})
+        for invalid in ({"exclusive_host_prefetch_enabled": True, "exclusive_expert_storage": False},
+                        {"exclusive_host_prefetch_d2h": True},
+                        *({"exclusive_host_cache_size_mb": size} for size in (0, -1, True, "1024", 1.5))):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                config_type(valid | invalid)
+        for key in ("exclusive_host_prefetch_enabled", "exclusive_host_prefetch_d2h"):
+            with self.assertRaises(TypeError):
+                config_type(valid | {key: "true"})
         for invalid in ({"cpu_moe": {"enabled": True}}, {"enable_multi_card": True},
                         {"expert_prefetch_enabled": True}, {"h2d_backend": "memfabric"},
                         {"prefill_split_gmm": True}, {"expert_offload": False}):

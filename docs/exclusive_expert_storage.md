@@ -72,7 +72,97 @@ not bound the upstream checkpoint loader's input tensors/page cache, NPU
 allocator reservations, other model components, or the complete Prefill pool.
 Measure RSS and NPU peak allocations separately on the serving machine.
 
+## Next-layer prediction and runtime Host copies
+
+This optional mode predicts the next MoE layer's demand, selects likely
+eviction victims, and prepares Host copies without moving predicted incoming
+experts into NPU slots. Add these fields to `expert_offload_config`:
+
+```json
+{
+  "exclusive_expert_storage": true,
+  "exclusive_host_prefetch_enabled": true,
+  "exclusive_host_prefetch_num": 2,
+  "exclusive_host_prefetch_tokens": 1,
+  "exclusive_host_cache_size_mb": 1024,
+  "exclusive_host_prefetch_d2h": true,
+  "expert_prefetch_enabled": false
+}
+```
+
+The Host mode defaults off, its cache budget defaults to 1024 MiB, and early
+D2H defaults off. With early D2H off, the cache retains existing Host sources
+after reactive H2D; there is no additional CPU-to-CPU weight copy. It has a
+warm-up period: initial NPU-only experts still require D2H on their first
+eviction unless an early backup is enabled. Predictions protect likely
+victim copies from cache replacement. With early D2H on, missing victim
+copies are downloaded asynchronously ahead of the next layer's demand.
+
+The cache is a fixed set of pinned expert bundles allocated before capture,
+within the global byte budget, round-robin across distinct expert layouts.
+Unused capacity smaller than a bundle remains unallocated. The budget must
+fit at least one complete bundle; a layout without cache slots falls back to
+ordinary exchange. Cache slots, required Host slots and the exchange spare
+rotate roles without allocating new weight memory at runtime. Total persistent
+weight storage is approximately one model copy plus this bounded redundancy
+and the exchange spares; the complete Prefill pool is still additional.
+Gate-weight prediction copies and small pinned route buffers are outside the
+expert-cache budget.
+
+The existing heuristic next-layer gate prediction and hash routing are used
+(not next-token prediction or the CPU/NPU hybrid prefetch driver). Prediction
+is staged after current-layer reactive loading and before its dispatch/GMM.
+`exclusive_host_prefetch_tokens` controls sampled token rows (default 1,
+bounded by available rows); `exclusive_host_prefetch_num` caps predicted
+misses/victim candidates (default 2, bounded by the model's routing top-k).
+Both must be positive integers and apply only when
+`exclusive_host_prefetch_enabled` is true. They are independent of the legacy
+`expert_prefetch_num` and `expert_prefetch_tokens`: changing those legacy
+settings does not affect Host prefetch. `expert_prefetch_enabled` remains
+false in exclusive mode because it controls prefetch into NPU slots. LRC
+selects cold victims when enabled; otherwise physical-slot order is used.
+All predicted residents are protected. Actual routing and victim selection
+remain authoritative and are not changed to force a cache hit.
+
+On each replay, dedicated per-target pinned prediction buffers feed a Host
+callback. The callback reserves backup slots and queues only D2H on the same
+load stream as reactive exchanges, then returns without waiting. That allows
+backup DMA to overlap current-layer compute. Cached bytes may still be in
+flight: they are valid only for subsequent operations ordered on that stream,
+never for unsynchronized CPU reads. Reusing a pending backup's memory also
+happens only through later operations on that stream. No separate event,
+compute-stream synchronization, NPU staging allocation, or residency-map
+change is introduced by prediction.
+
+At actual eviction, a victim with a Host copy skips reactive D2H: its copy
+becomes the required Host source and the incoming expert's old Host bundle
+becomes a resident backup. On a miss, ordinary ordered D2H/H2D exchange is
+used; an available cache slot can replace the rotating spare so the incoming
+source can be retained. Only redundant resident copies may be discarded.
+The pool lock and batch transaction cover both cache and ownership changes.
+Wrong predictions may waste bandwidth but cannot overwrite an unpreserved
+expert. All-hit layers need not wait for speculative backup reads before GMM.
+Submission/completion failures terminate the worker instead of reusing an
+uncertain copy. This assumes inference weights are immutable, as in the
+existing offload path.
+
+`[EXCLUSIVE-HOST-CACHE]` periodically reports counters using
+`cache_stats_log_interval`, and reports final counters at close:
+
+- `cache_hits` / `saved_bytes`: reactive D2H avoided by cached victim copies.
+- `backup_d2h` / `backup_bytes`: speculative D2H that was performed early.
+- `reactive_d2h` / `reactive_bytes`: demand-time D2H still required.
+- `retained`, `evicted`, `predictions`, `candidates`: cache/prediction activity.
+
+Early backup hides transfer latency only when computation overlaps it; it
+does not inherently reduce total D2H bytes. Compare `backup_bytes +
+reactive_bytes`, cache hit rate, TPOT and profiler overlap against cache-only
+and disabled runs. No speedup is assumed without hardware measurement.
+
 ## Optional parallel checkpoint loading
+
+The checkpoint-loading pool described below is separate from the runtime
+Host-copy cache; neither option enables NPU weight staging.
 
 To overlap checkpoint iteration with parallel transpose/copies into the final
 Host buffers, add these fields to `expert_offload_config`:
@@ -156,6 +246,7 @@ Dependency-free orchestration tests:
 ```bash
 python tests/ut/expert_offload/test_exclusive_pool.py -v
 python tests/ut/expert_offload/test_load_buffer_pool.py -v
+python tests/ut/expert_offload/test_exclusive_host_prefetch.py -v
 ```
 
 Small NPU startup regression without loading a checkpoint. It checks that

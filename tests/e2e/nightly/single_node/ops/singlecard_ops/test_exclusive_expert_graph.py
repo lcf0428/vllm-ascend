@@ -46,10 +46,12 @@ def test_mxfp4_finalization_preserves_real_nz_slots(monkeypatch):
 
 
 @pytest.mark.parametrize("capture", [False, True])
-def test_exclusive_swap_repeated_routes(capture):
+@pytest.mark.parametrize("shadow_mode", ["off", "retain", "early"])
+def test_exclusive_swap_repeated_routes(capture, shadow_mode):
     torch.npu.set_device(0)
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = SimpleNamespace(shard_per_rank=False)
+    manager.offload_config = SimpleNamespace(shard_per_rank=False, exclusive_host_prefetch_d2h=shadow_mode == "early",
+                                            exclusive_host_prefetch_num=2, cache_stats_log_interval=10000)
     manager.load_stream = torch_npu.npu.Stream()
     manager.h2d_transport = TorchCopyH2DTransport()
     manager._exclusive_pool = ExclusiveExpertPool()
@@ -71,14 +73,32 @@ def test_exclusive_swap_repeated_routes(capture):
         0, bundles, [0, 1, -1, -1, -1, -1],
         allocate_spare=lambda template: {name: torch.empty_like(t, pin_memory=True)
                                          for name, t in template.items()})
+    if shadow_mode != "off":
+        manager._exclusive_pool.configure_shadow_cache(
+            2 * len(fields) * 1024,
+            lambda template: {name: torch.empty_like(t, pin_memory=True) for name, t in template.items()},
+        )
+    manager.moe_layers = [layer]
+    manager.num_total_experts = 6
+    manager.topk = 2
+    manager.cache_policy = None
     del bundles
     route = torch.tensor([2, 3], dtype=torch.int32, device="npu")
     route_h = torch.empty(2, dtype=torch.int32, pin_memory=True)
+    predicted = torch.tensor([[2, 3]], dtype=torch.int32, device="npu")
+    predicted_h = torch.empty((1, 2), dtype=torch.int32, pin_memory=True)
+    prediction_scores = torch.ones((1, 2))
     observed = [torch.empty_like(getattr(layer, name if "scale" in name else name + "_weight"))
                 for name in fields]
     weights = [getattr(layer, name if "scale" in name else name + "_weight") for name in fields]
     addresses = [value.data_ptr() for value in weights]
     errors = []
+
+    def backup(_):
+        try:
+            manager._exclusive_host_prefetch((0, predicted_h, prediction_scores))
+        except BaseException as error:
+            errors.append(error)
 
     def exchange(_):
         try:
@@ -92,6 +112,12 @@ def test_exclusive_swap_repeated_routes(capture):
     torch_npu.npu._subscribe_report(stream)
 
     def record():
+        if shadow_mode != "off":
+            predicted_h.copy_(predicted, non_blocking=capture)
+            if capture:
+                torch_npu.npu._launch_host_func(stream, backup, None)
+            else:
+                backup(None)
         route_h.copy_(route, non_blocking=capture)
         if capture:
             torch_npu.npu._launch_host_func(stream, exchange, None)
@@ -105,8 +131,10 @@ def test_exclusive_swap_repeated_routes(capture):
     if capture:
         with torch.npu.graph(graph, stream=stream):
             record()
-    for ids in [(2, 3), (2, 3), (0, 1), (4, 5), (2, 3), (4, 3), (0, 5)] * 3:
+    for iteration, ids in enumerate([(2, 3), (2, 3), (0, 1), (4, 5), (2, 3), (4, 3), (0, 5)] * 3):
         route.copy_(torch.tensor(ids, dtype=torch.int32, device="npu"))
+        # Include wrong predictions; actual routes must remain authoritative.
+        predicted.copy_(torch.tensor([ids if iteration % 3 else (4, 5)], dtype=torch.int32, device="npu"))
         if capture:
             graph.replay()
         else:
@@ -119,8 +147,13 @@ def test_exclusive_swap_repeated_routes(capture):
         for (_, eid), host in manager._exclusive_pool.host.items():
             for j, name in enumerate(fields):
                 torch.testing.assert_close(host[name], torch.full_like(host[name], eid + j))
+        for (_, eid), shadow in manager._exclusive_pool.shadows.items():
+            for j, name in enumerate(fields):
+                torch.testing.assert_close(shadow[name], torch.full_like(shadow[name], eid + j))
         torch.testing.assert_close(layer.w13_weight_scale_fp32.cpu(),
                                    torch.stack([torch.full((32, 32), float(eid + 2)) for eid in ids]))
         assert len(manager._exclusive_pool.host) == 4
         assert len(manager._exclusive_pool.spares) == 1
         assert addresses == [value.data_ptr() for value in weights]
+    if shadow_mode != "off":
+        assert manager._exclusive_pool.shadow_stats["cache_hits"] > 0
