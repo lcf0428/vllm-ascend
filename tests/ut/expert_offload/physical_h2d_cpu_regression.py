@@ -16,9 +16,6 @@ class TorchProxy:
  npu=NPU()
  def __getattr__(self,name):return getattr(real_torch,name)
 torch=TorchProxy()
-class Phase:
- def __getattr__(self,name):return name
-phase=Phase()
 def stamp(record,name):
  if record is not None:record[name+'_ns']=time.monotonic_ns();record[name+'_cpu_ns']=time.thread_time_ns()
 module=types.ModuleType('vllm_ascend.expert_offload.dma_submit_timing');module.stamp=stamp;sys.modules[module.__name__]=module
@@ -28,14 +25,14 @@ def definitions(path,names,env):
  assert len(nodes)==len(names),(path,names)
  exec(compile(ast.Module(body=nodes,type_ignores=[]),str(path),'exec'),env)
 
-env=dict(globals(),__package__='vllm_ascend.expert_offload',dataclass=dataclasses.dataclass,Enum=enum.Enum,Any=typing.Any,CpuPrefetchPhase=phase)
+env=dict(globals(),__package__='vllm_ascend.expert_offload',dataclass=dataclasses.dataclass,Enum=enum.Enum,Any=typing.Any)
 definitions(D/'h2d_transfer.py',{'CopyDirection','H2DCopyTask','TorchCopyH2DTransport'},env)
 module=types.ModuleType('vllm_ascend.expert_offload.h2d_transfer');module.H2DCopyTask=env['H2DCopyTask'];sys.modules[module.__name__]=module
 module=types.ModuleType('vllm_ascend.expert_offload.prepared_h2d');module.__package__='vllm_ascend.expert_offload';sys.modules[module.__name__]=module;exec(compile((D/'prepared_h2d.py').read_text(),str(D/'prepared_h2d.py'),'exec'),module.__dict__)
 plan_type=module.PreparedLayerH2D
 env['prepare_mapping_copy']=module.prepare_mapping_copy
 source=ast.parse((D/'expert_offload_manager.py').read_text());cls=next(n for n in source.body if isinstance(n,ast.ClassDef) and n.name=='ExpertOffloadManager')
-names={'_assert_native_dma_reload_safe','_init_layer_scale_buffers','_copy_scale_assembled','_copy_scale_direct','_load_scale_shard','_get_h2d_transport','_cached_expert_h2d_view','_cached_expert_h2d_task','_expert_src_storage','_build_quant_attr_h2d_tasks','_build_expert_h2d_tasks','_build_prefill_h2d_tasks','_load_expert_weights_into_slots','_refresh_expert_fp32_scale','process_weights_after_loading','_synchronize_h2d'}
+names={'_finalize_offload','_assert_native_dma_reload_safe','_init_layer_scale_buffers','_copy_scale_assembled','_copy_scale_direct','_load_scale_shard','_get_h2d_transport','_cached_expert_h2d_view','_cached_expert_h2d_task','_expert_src_storage','_build_quant_attr_h2d_tasks','_build_expert_h2d_tasks','_build_prefill_h2d_tasks','_load_expert_weights_into_slots','_refresh_expert_fp32_scale','process_weights_after_loading','_synchronize_h2d'}
 if any(isinstance(n,ast.FunctionDef) and n.name=='_prepare_expert_h2d_layer' for n in cls.body):names.add('_prepare_expert_h2d_layer')
 methods=[n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name in names];assert len(methods)==len(names)
 env['logger']=logging.getLogger('h2d-regression')
@@ -55,7 +52,8 @@ layout=quant.apply_mxfp4_weight_scale_layout
 worker_cls=next(n for n in ast.parse((D/'host_transfer.py').read_text()).body if isinstance(n,ast.ClassDef) and n.name=='HostWeightWorker');process=next(n for n in worker_cls.body if isinstance(n,ast.FunctionDef) and n.name=='_process')
 exec(compile(ast.Module(body=[process],type_ignores=[]),str(D/'host_transfer.py'),'exec'),env)
 process=env['_process']
-env['HostTransferPolicy']=lambda **kwargs:NS(**kwargs)
+sys.modules['_vllm_ascend_lrc']=NS(NativeHostPlanner=lambda *args:object())
+env['HostTransferPolicy']=lambda **kwargs:NS(**kwargs,cpu_unit=1,cpu_extra_unit=1,copy_unit=1,scores=[],npu_fixed_unit=0)
 definitions(D/'host_transfer.py',{'HostExpertTransfer'},env)
 Transfer=env['HostExpertTransfer']
 
@@ -64,7 +62,7 @@ class Layer:
 
 class Fixture:
  def __init__(self,slots=2,strided=False,cast=False):
-  m=self.manager=Manager();m.offload_config=NS(shard_per_rank=False,cpu_moe=NS(weight_format='gguf'));m.num_total_experts=3;m.ep_size=1
+  m=self.manager=Manager();m.offload_config=NS(shard_per_rank=False,cpu_moe=NS(enabled=False));m.num_total_experts=3;m.ep_size=1;m._host_hybrid_enabled=False
   m._allocate_expert_host_tensor=lambda shape,dtype:real_torch.empty(shape,dtype=dtype)
   m.w13_expert_size_bytes=8;m.w2_expert_size_bytes=4;m._shard_local=lambda e:e
   m.w13_weights_cpu=[[real_torch.full((8,),11+e,dtype=real_torch.uint8) for e in range(3)]]
@@ -73,7 +71,7 @@ class Fixture:
   if strided:scales=[s.t() for s in scales]
   m.scale_cpu_buffers={'scale':[scales]};m.offset_cpu_buffers={};m.scale_bias_cpu_buffers={}
   self.layer=Layer(w13_weight=real_torch.zeros((slots,8),dtype=real_torch.uint8),w2_weight=real_torch.zeros((slots,4),dtype=real_torch.uint8),scale=real_torch.zeros((slots,4) if strided else (slots,2,2),dtype=real_torch.float64 if cast else real_torch.float32))
-  m._prefetch_trace=NS(mark=lambda *args:None);m.h2d_transport=Transport()
+  m.h2d_transport=Transport()
   m._prefill_w13=[real_torch.zeros((3,8),dtype=real_torch.uint8)];m._prefill_w2=[real_torch.zeros((3,4),dtype=real_torch.uint8)]
   for attr in ('_prefill_w13_scale','_prefill_w2_scale','_prefill_w13_offset','_prefill_w2_offset','_prefill_w13_scale_bias','_prefill_w2_scale_bias'):setattr(m,attr,[])
  def prepare(self):
@@ -81,6 +79,12 @@ class Fixture:
   else:self.manager._prepared_expert_h2d={0:plan_type(self.manager,self.layer,0,env['_expert_weight'])}
 
 class Tests(unittest.TestCase):
+ def test_cpu_moe_enabled_requires_a_registered_layer(self):
+  m=Manager();m.moe_layers=[];m._host_hybrid_enabled=False
+  m._finalize_offload(None)
+  m._host_hybrid_enabled=True
+  with self.assertRaisesRegex(ValueError,'no eligible MXFP4 MoE layers'):
+   m._finalize_offload(None)
  def test_native_table_owns_exact_existing_buffers(self):
   f=Fixture();f.prepare();plan=f.manager._prepared_expert_h2d[0]
   owners=tuple(plan.owners)
@@ -98,7 +102,7 @@ class Tests(unittest.TestCase):
   plan.native_dma_live=False;f.prepare()
 
  def test_cold_hook_covers_initial_and_late_layers(self):
-  f=Fixture();m=f.manager;m.moe_layers=[f.layer];m.offload_config.cpu_moe=NS(native_dispatch=False);m.num_device_experts_for_layer=lambda i:2;m.cache_policy=None
+  f=Fixture();m=f.manager;m.moe_layers=[f.layer];m.offload_config.cpu_moe=NS(balance_max_transfers=1);m.num_device_experts_for_layer=lambda i:2;m.cache_policy=None
   Transfer(m,f.layer,NS(),NS());self.assertIs(m._prepared_expert_h2d[0].layer,f.layer)
   late=copy.deepcopy(f.layer);m.moe_layers.append(late)
   for buffers in (m.w13_weights_cpu,m.w2_weights_cpu,*m.scale_cpu_buffers.values()):buffers.append([t.clone() for t in buffers[0]])
@@ -168,7 +172,7 @@ class Tests(unittest.TestCase):
    m.scale_cpu_buffers['scale'][0][1].fill_(value);f.prepare();m.h2d_transport.copy_batch(m._build_expert_h2d_tasks(f.layer,0,1,0));self.assertTrue(real_torch.all(f.layer.scale[0]==value))
  def test_reformat_rejects_live_shared_nz_owner(self):
   f=Fixture();f.prepare();m=f.manager;torch.npu.events=[]
-  m.offload_config.cpu_moe.weight_format='nz_mxfp4';m._cpu_weights_finalized=True
+  m._host_hybrid_enabled=True;m._cpu_weights_finalized=True
   with self.assertRaisesRegex(RuntimeError,'Retire the NZ CPU backend'):
    m.process_weights_after_loading()
   self.assertEqual(torch.npu.events,[]);self.assertIn(0,m._prepared_expert_h2d)

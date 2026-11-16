@@ -1,9 +1,13 @@
 # CPU LRC and DMA for hybrid experts
 
+> **Draft / 草稿版。** The cumulative CPU MoE changes on this branch have
+> yet to be verified on Ascend hardware. This draft is for review and hardware validation.
+
 The single-card hybrid path uses CPU admission and LRC, host-submitted weight
-DMA, and the existing mapped-host CPU result combine. Expert prefetch is
-disabled for this path. The old NPU admission setting is rejected when CPU MoE
-is enabled; use `cpu_moe.transfer_scheduler="cpu"`.
+DMA, and mapped-host CPU result combine. Native dispatch supports optional
+next-layer prefetch. Remove `backend`, `transfer_copy_library`,
+`transfer_trace_capacity`, and `transfer_trace_mode` from old CPU MoE
+configurations. Remove `transfer_policy` and `transfer_scheduler` as well. The CPU MoE host planner always balances CPU work and weight DMA.
 
 ## Runtime dependencies
 
@@ -20,28 +24,56 @@ Its existing hotness, protected-expert and deterministic victim ordering are
 retained. Host hybrid admission uses this implementation when the cache policy
 is enabled; ordinary non-hybrid paging keeps its original Python policy.
 
-Graph CPU submission polls an ordered D2H sequence. With
-`cpu_moe.native_dispatch=true` shared NZ starts the C++ dispatcher with the CPU backend.
-The older x86 Python dispatcher uses `KT_MOE_POLL_LIBRARY` to load its
-`register_flag` and `poll_next` implementation before backend creation.
-The installed kt-kernel must expose pinned input/output buffers and the existing
-completion runtime. Mapped combine and value-based `ExternalEvent` support
-remain required.
+Graph CPU submission polls an ordered D2H sequence and starts the C++
+dispatcher with the CPU backend. The installed kt-kernel must expose the
+native dispatch ABI and pinned input/output buffers. Mapped combine and
+value-based `ExternalEvent` support remain required.
 
 Select `h2d_backend="torch"` for the host transfer transport. Shared NZ
 graph replay submits the prepared DMA copies through the native dispatcher.
 Set `cpu_moe.max_num_tokens` to cover every captured decode/verification batch;
-an oversized hybrid graph raises rather than entering legacy callback paging.
-Eager batches above that capacity retain ordinary paging.
+capture sizes are token counts. For single-card MRV1 full-decode-only mode, the
+worker checks the requested sizes before loading weights, including speculative
+decode alignment and the scheduler's sequence limit. MRV1 also validates the
+resolved target-model graph descriptors before capture. Eager batches above the
+CPU MoE capacity retain ordinary paging.
+
+### CPU and NUMA affinity
+
+CPU MoE startup requires a kt-kernel build that exports
+`available_worker_pool_cpus` and accepts explicit placement in
+`WorkerPoolConfig.subpool_cpus`. Before loading weights, the CPU MoE worker
+resolves the bound NPU's physical device ID, reads `npu-smi info -t topo`,
+and maps its CPU affinity to a NUMA node using Linux sysfs. If that node can
+support the compute pool, it is preferred for compute, shared weights and
+DMA submission. The planner reserves DMA first, then poll and completion.
+It moves service roles off-node as needed to preserve the requested compute
+thread count, or at least one compute core when no count was specified.
+
+When the topology is missing, ambiguous, or the device-local node cannot
+satisfy the configured placement, the worker selects the allowed NUMA node
+with the most compute cores after reserving services. This fallback uses
+service cores outside the compute pool first. Set `cpuinfer_threads` or
+`numa_nodes` to override the automatic thread count or node.
+
+Omit `KT_MOE_POLL_CPU`, `KT_MOE_COMPLETION_CPU`, and
+`cpu_moe.native_dispatch_dma_cpu` for automatic service placement. Explicit role assignments
+use Linux logical CPU IDs. Explicit DMA placement may use a core outside the
+inherited affinity if the worker's effective cpuset permits it. Compute and
+service roles take distinct physical cores, including when SMT is enabled.
+Shared weights prefer the selected compute node unless
+`cpu_moe.host_weight_numa_node` overrides it. When a container blocks memory
+policy syscalls, automatic placement falls back to allocating from a CPU on
+the selected node. The worker logs the plan before loading weights. The reference CPU MoE
+launcher sets `enable_cpu_binding=false` to use the CPU MoE thread bindings
+without the ARM worker's post-warmup process-wide binding.
 
 ### Shared NZ CPU weights
 
-Use vLLM 0.30.0 and build kt-kernel from
-[cpu_moe_compute at 599e66a](https://github.com/yxk-fdu/cpu_moe_compute/tree/599e66a4f3155f21e02b2a924bd8a372430cabd7/cpu_moe).
-This revision includes the AArch64 build fix for the packaged ready-poll helper.
-Set `cpu_moe.weight_format="nz_mxfp4"`, `native_dispatch=true`, and
-`threadpool_count=1`. Place the host DMA buffers and compute pool on the
-same NUMA node. Leave `cpu_moe.weight_path` empty.
+Use vLLM 0.30.0 and the matching kt-kernel build with `NZMOE` and the
+affinity preflight export above. `cpu_moe.enabled=true` attaches the shared
+NZ backend to every eligible MoE layer and requires one NUMA pool. Place the
+shared weight buffers and compute pool on the same NUMA node.
 Set `KT_MOE_MATCH_NPU_MXFP8=1` before loading the backend. The graph dispatcher
 uses the CPU backend's native ABI directly. The ARM shared NZ path was
 verified on Ascend 950DT with CANN 9.2.1. On ARM, graph results are written
@@ -91,10 +123,12 @@ input ready -> CPU admission/LRC
 There is no ordering between weight completion and CPU output completion.
 The first version computes the NPU-owned routes together after weights_ready;
 it does not split existing hits and newly uploaded experts into two NPU calls.
-The proportional load-balance rule remains
-`floor(missing * cpu_cost / (cpu_cost + copy_cost))`, bounded by available slots
-and `balance_max_transfers`. LRC selects victims; it does not choose how many
-experts the CPU computes. `first_miss` and frequency admission are also retained.
+The planner ranks missing experts by the number of routed tokens and checks
+each candidate transfer count up to `balance_max_transfers` and the available
+slots. It minimizes the larger of estimated CPU time and the estimated DMA
+time plus NPU layer cost. Startup calibration measures one CPU route, two
+routes to the same expert, and the H2D cost of one expert. The planner charges
+first and additional routes separately. LRC ranks eviction victims independently.
 
 ## Graph and lifetime rules
 
@@ -106,9 +140,10 @@ Eager contexts retain their pinned buffers across asynchronous H2D. Draft/MTP
 layers registered after finalization use their manager ordinal for LRC/weight
 storage and their model layer index for CPUInfer.
 
-DMA errors are retained and raised on subsequent host submissions. A failed
-request never publishes weight readiness. An already waiting graph follows the
-runtime task-timeout/error path; do not continue inference with that graph.
+Python DMA worker initialization errors fail startup. If an accepted DMA
+request fails on the Python worker or native dispatcher, the worker process
+exits and leaves the failed request's weight event unsignalled. The service
+supervisor must replace the failed worker before forwarding requests again.
 Shutdown drains live device work while poll, compute and DMA workers are alive,
 then retires DMA resources.
 
@@ -125,17 +160,13 @@ pytest -q tests/ut/expert_offload/test_host_hybrid_transfer.py \
   tests/ut/expert_offload/test_cpu_moe_wiring.py \
   tests/ut/expert_offload/test_nz_mxfp4_backend.py \
   tests/ut/expert_offload/test_shared_nz_owner.py \
-  tests/ut/expert_offload/cpu_backend/test_async_completion_handoff.py
+  tests/ut/expert_offload/test_cpu_weight_load_order.py
 ```
 
-On an Ascend machine with the dependencies above, run:
+On an Ascend machine with the dependencies above, run the mapped combine
+operator test and the native dispatch, demand DMA and next-layer prefetch
+checks in `tests/ut/expert_offload/`.
 
 ```bash
-pytest -q tests/e2e/cpu_moe/test_host_hybrid_graph.py \
-  tests/e2e/cpu_moe/test_mapped_result_combine.py
+pytest -q tests/e2e/cpu_moe/test_mapped_combine_operator.py
 ```
-
-The new hardware test uses deterministic small expert stand-ins, changing
-routes across two captured graphs and 30 replays, with either CPU or DMA
-artificially delayed. It covers real NPU DMA/events and mapped combine; full
-model accuracy and performance still need a model-level server run.

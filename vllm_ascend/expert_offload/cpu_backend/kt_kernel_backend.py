@@ -1,7 +1,7 @@
-"""kt-kernel LLAMAFILE backend for CPU routed experts.
+"""kt-kernel shared NZ backend for CPU routed experts.
 
 This adapter reuses ktransformers' pinned buffers, CPUInfer worker pool, and
-GGUF/LLAMAFILE MoE implementation.  Two execution modes are supported:
+shared NZ MoE implementation.  Two execution modes are supported:
 
 * **eager** -- submit stages inputs and queues CPU work; wait drains the
   worker pool and returns the pinned host output for mapped combine.
@@ -17,7 +17,6 @@ which is which.
 """
 
 from __future__ import annotations
-from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import Phase as CpuPrefetchPhase
 
 from dataclasses import dataclass
 import json
@@ -25,7 +24,6 @@ import os
 import platform
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable
 
 import torch
@@ -79,18 +77,16 @@ class KtKernelBackendConfig:
     top_k: int
     hidden_size: int
     intermediate_size: int
-    weight_path: str
     cpuinfer_threads: int = 32
     threadpool_count: int = 1
     max_num_tokens: int = 1
     numa_nodes: tuple[int, ...] | None = None
-    native_dispatch: bool = False
-    weight_format: str = "gguf"
+    compute_cpus: tuple[tuple[int, ...], ...] = ()
+    poll_cpu: int | None = None
+    completion_cpu: int | None = None
 
     def __post_init__(self) -> None:
-        if self.weight_format not in ("gguf", "nz_mxfp4"):
-            raise ValueError("weight_format must be gguf or nz_mxfp4")
-        if self.weight_format == "nz_mxfp4" and self.threadpool_count != 1:
+        if self.threadpool_count != 1:
             raise ValueError("Native MXFP4 currently requires one NUMA pool")
         positive_fields = {
             "num_experts": self.num_experts,
@@ -114,17 +110,6 @@ class KtKernelBackendConfig:
                 "numa_nodes must contain one node per thread pool; "
                 f"got nodes={len(self.numa_nodes)}, "
                 f"threadpool_count={self.threadpool_count}")
-
-    def resolved_weight_path(self) -> str:
-        """Resolve the reference project's per-layer GGUF template."""
-        try:
-            path = self.weight_path.format(layer_idx=self.layer_idx)
-        except (IndexError, KeyError, ValueError) as exc:
-            raise ValueError(
-                "weight_path must be literal or use the {layer_idx} field") from exc
-        if self.weight_format != "nz_mxfp4" and not Path(path).is_file():
-            raise FileNotFoundError(f"CPU MoE GGUF not found: {path}")
-        return path
 
 
 # Batch sizes whose pinned buffers a captured graph has already baked in.
@@ -226,7 +211,7 @@ class _KtKernelExpertTask:
         self._hidden_states = hidden_states
         self._stream_handle = stream_handle
         self.host_mapped_result = not (
-            platform.machine() == "aarch64" and backend.config.weight_format == "nz_mxfp4"
+            platform.machine() == "aarch64"
         )
         self._result: torch.Tensor | None = None
         self._error: BaseException | None = None
@@ -246,12 +231,7 @@ class _KtKernelExpertTask:
             sync_begin = time.perf_counter_ns()
             _eager_trace("cpu_moe.sync_begin", layer=self._backend.config.layer_idx, task_created_ns=self._created_ns, wait_queue_ns=sync_begin - self._created_ns)
             try:
-                cpu_diag = getattr(self._backend, "_cpu_prefetch_trace", None)
-                if cpu_diag is not None:
-                    cpu_diag.mark_operation(CpuPrefetchPhase.KT_DRAIN_BEGIN, self._backend.config.layer_idx)
                 self._backend._wrapper.drain_pinned_forward()
-                if cpu_diag is not None:
-                    cpu_diag.mark_operation(CpuPrefetchPhase.KT_DRAIN_END, self._backend.config.layer_idx)
                 self._result = self._backend._wrapper.get_forward_output_buffers(
                     self._hidden_states)[0]
             except BaseException as exc:
@@ -342,24 +322,14 @@ def _current_stream_handle(device: torch.device) -> int:
     return int(stream.cuda_stream)
 
 
-def _default_wrapper_factory(weight_format="gguf", native_weights=None, **kwargs: Any) -> Any:
-    if weight_format == "nz_mxfp4":
-        from kt_kernel.utils.nz_mxfp4 import NZMoEWrapper
-        if native_weights is None:
-            raise RuntimeError("NZ CPU must borrow finalized DMA source owners")
-        return NZMoEWrapper(native_weights=native_weights, **kwargs)
-    try:
-        from kt_kernel import KTMoEWrapper
-    except ImportError as exc:
-        raise RuntimeError(
-            "kt-kernel is not importable. Build the reference project's "
-            "Ascend-enabled kt-kernel and add it to PYTHONPATH before enabling "
-            "the CPU MoE backend.") from exc
-    return KTMoEWrapper(method="LLAMAFILE", mode="inference", **kwargs)
+def _default_wrapper_factory(native_weights, **kwargs: Any) -> Any:
+    from kt_kernel.utils.nz_mxfp4 import NZMoEWrapper
+
+    return NZMoEWrapper(native_weights=native_weights, weight_path="", **kwargs)
 
 
 class KtKernelCPUExpertBackend:
-    """Adapt the reference kt-kernel LLAMAFILE wrapper to vLLM-Ascend.
+    """Adapt the kt-kernel shared NZ wrapper to vLLM-Ascend.
 
     The CPU/NPU split is derived from the current ``log2phy`` on every step.
     The executor normally marks NPU-owned routes with ``-1``; graph transfer
@@ -389,13 +359,10 @@ class KtKernelCPUExpertBackend:
         # has no task object of its own to carry the timestamp.
         self._graph_task_created_ns: int | None = None
 
-        native_options = {}
-        if config.weight_format == "nz_mxfp4":
-            native_options = {"weight_format": config.weight_format, "native_weights": native_weights}
-        elif native_weights is not None:
-            raise ValueError("native_weights requires weight_format=nz_mxfp4")
+        if native_weights is None:
+            raise RuntimeError("NZ CPU must borrow finalized DMA source owners")
         self._wrapper = wrapper_factory(
-            **native_options,
+            native_weights=native_weights,
             layer_idx=config.layer_idx,
             num_experts=config.num_experts,
             num_experts_per_tok=config.top_k,
@@ -404,12 +371,12 @@ class KtKernelCPUExpertBackend:
             gpu_experts_mask=None,
             cpuinfer_threads=config.cpuinfer_threads,
             threadpool_count=config.threadpool_count,
-            weight_path=config.resolved_weight_path(),
             chunked_prefill_size=config.max_num_tokens,
             cpu_save=False,
             max_deferred_experts_per_token=0,
             numa_nodes=(list(config.numa_nodes)
                         if config.numa_nodes is not None else None),
+            compute_cpus=config.compute_cpus,
         )
         required_methods = ("load_weights", "submit_forward", "sync_forward")
         missing_methods = [
@@ -420,14 +387,12 @@ class KtKernelCPUExpertBackend:
             raise TypeError(
                 "kt-kernel wrapper is missing required methods: "
                 + ", ".join(missing_methods))
-        # Per-layer GGUFs use logical expert order; kt-kernel's identity mapping
-        # is therefore the correct default.  Every expert stays resident on the
-        # CPU side -- the mask never gated weight loading.
+        # Shared NZ owners are indexed by logical expert ID.
         self._wrapper.load_weights(None)
         self._host_transfer = None
-        if (config.native_dispatch and config.weight_format == "nz_mxfp4") or os.environ.get("KT_MOE_POLL_LIBRARY"):
-            from . import poll_submission
-            poll_submission.prepare(self)
+        from . import poll_submission
+
+        poll_submission.prepare(self)
 
     @property
     def max_num_tokens(self) -> int:
@@ -548,8 +513,7 @@ class KtKernelCPUExpertBackend:
         """
         self._require_graph_methods()
         if not hasattr(self, "_poll_sequence_slots"):
-            raise RuntimeError("Graph CPU MoE requires native_dispatch or KT_MOE_POLL_LIBRARY "
-                               "before backend initialization")
+            raise RuntimeError("Graph CPU MoE requires the shared NZ native dispatcher")
         self._pin_graph_batch_size(hidden_states)
 
         import torch_npu
@@ -626,13 +590,8 @@ class KtKernelCPUExpertBackend:
         callback_begin_wall_ns = time.time_ns()
         # Python -> C++ CPUInfer.submit -> MoE 入口 -> TaskQueue.enqueue。
         # 队列后台线程执行 forward，再调度 CPU 计算线程池。
-        cpu_diag = getattr(self, "_cpu_prefetch_trace", None)
-        if cpu_diag is not None:
-            cpu_diag.mark_operation(CpuPrefetchPhase.KT_SUBMIT_BEGIN, self.config.layer_idx, trace_task_id)
         self._wrapper.forward_on_pinned_buffers(
             hidden_states, stream_handle, stream_already_subscribed=True)
-        if cpu_diag is not None:
-            cpu_diag.mark_operation(CpuPrefetchPhase.KT_SUBMIT_END, self.config.layer_idx, trace_task_id)
         submit_end = time.perf_counter_ns()
         if os.environ.get("KT_MOE_LIFECYCLE_TRACE"):
             kt_kernel_ext.lifecycle_mark("submit_return")
@@ -686,12 +645,7 @@ class KtKernelCPUExpertBackend:
             from kt_kernel import kt_kernel_ext
             kt_kernel_ext.lifecycle_mark("drain_enter")
         sync_begin = time.perf_counter_ns()
-        cpu_diag = getattr(self, "_cpu_prefetch_trace", None)
-        if cpu_diag is not None:
-            cpu_diag.mark_operation(CpuPrefetchPhase.KT_DRAIN_BEGIN, self.config.layer_idx)
         self._wrapper.drain_pinned_forward()
-        if cpu_diag is not None:
-            cpu_diag.mark_operation(CpuPrefetchPhase.KT_DRAIN_END, self.config.layer_idx)
         sync_end = time.perf_counter_ns()
         if os.environ.get("KT_MOE_LIFECYCLE_TRACE"):
             kt_kernel_ext.lifecycle_mark("drain_return")

@@ -149,14 +149,6 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
             e_score_correction_bias=routing["e_score_correction_bias"],
             is_hash_routed=routing["is_hash_routed"],
         )
-        # The actual current-layer top-k is the authoritative observation for
-        # the target layer's NPU-owned LRC table. This does not alter routing;
-        # it only updates the device-side eviction state before next-layer
-        # prediction is launched.
-        if cpu_moe_enabled:
-            mgr.observe_device_prefetch_route(
-                mgr.moe_layers.index(layer), topk_ids, topk_weights
-            )
         if prepared is not None:
             def prepare_prefetch(cpu_task):
                 nonlocal prefetch_started_early

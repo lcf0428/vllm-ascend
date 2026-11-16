@@ -28,7 +28,7 @@ try:
     cd, ch, ci, cw, cm, ce = buffers()
     weight_event = torch_npu.npu.ExternalEvent()
     weight_event.reset()
-    planner = NativeHostPlanner(4, 1, 0, 0, 1, 0, 'load_balance', None, [0.] * 4)
+    planner = NativeHostPlanner(4, 1, 0, 0, 1, 0, None, [0.] * 4)
     task = fixture.task()
     address = fixture.address(task)
     engine.add_prefetch(ph.data_ptr(), pi.data_ptr(), pw.data_ptr(), pm.data_ptr(), int(pe.npu_event),
@@ -68,7 +68,7 @@ try:
     device_weights = torch.zeros(1, device='npu')
     observed = torch.zeros(1, device='npu')
     state = Policy(1, 4, 32, .9, 1., .5, .3, .01, False)
-    load_planner = NativeHostPlanner(4, 1, 0, 0, 1, 0, 'load_balance', state, [0.] * 4)
+    load_planner = NativeHostPlanner(4, 1, 0, 0, 1, 0, state, [0.] * 4)
     channel = engine.add_prefetch(dh.data_ptr(), ids.data_ptr(), weights.data_ptr(), mapping.data_ptr(),
                                    int(done.npu_event), 1, 1, 0, 4, 4, 1, load_planner)
     torch.npu.synchronize()

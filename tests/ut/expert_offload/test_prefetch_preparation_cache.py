@@ -1,4 +1,3 @@
-import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -102,7 +101,7 @@ def test_quant_copy_preserves_original_field_operations():
     assert all(torch.equal(s, d) for s, d in zip(sources, destinations))
 
 
-def test_trace_and_strided_destination_keep_per_field_fallback():
+def test_strided_destination_keeps_per_field_copy():
     sources = [torch.ones(4), torch.ones(4)]
     destinations = [torch.zeros(4), torch.zeros(8)[::2]]
     tasks = [H2DCopyTask(s, d, 16) for s, d in zip(sources, destinations)]
@@ -110,13 +109,6 @@ def test_trace_and_strided_destination_keep_per_field_fallback():
     with patch("torch._foreach_copy_") as foreach:
         transport.copy_batch(tasks)
     foreach.assert_not_called()
-    trace = SimpleNamespace(_local=threading.local(), mark=MagicMock())
-    trace._local.context = (1, 0, 0)
-    transport._cpu_prefetch_trace = trace
-    with patch("torch._foreach_copy_") as foreach:
-        transport.copy_batch(tasks)
-    foreach.assert_not_called()
-    assert trace.mark.call_count == 4
 
 
 def test_replaced_views_retire_after_all_related_h2d_streams_drain():
@@ -128,15 +120,15 @@ def test_replaced_views_retire_after_all_related_h2d_streams_drain():
     concurrent_retirement = object()
     manager.load_stream = SimpleNamespace(synchronize=MagicMock(
         side_effect=lambda: manager._retired_expert_h2d_views.append(concurrent_retirement)))
-    manager._cpu_prefetch_dma_stream = SimpleNamespace(synchronize=MagicMock())
+    dma_stream = SimpleNamespace(synchronize=MagicMock())
     manager._prefetch_stream = SimpleNamespace(synchronize=MagicMock(
         side_effect=AssertionError("handshake stream waits for this callback's done")))
     manager.h2d_transport = SimpleNamespace(
         synchronize=MagicMock(side_effect=lambda stream: stream.synchronize()), close=MagicMock())
-    manager._synchronize_h2d(manager._cpu_prefetch_dma_stream)
+    manager._synchronize_h2d(dma_stream)
     assert manager.h2d_transport.synchronize.call_count == 2
     manager.load_stream.synchronize.assert_called_once()
-    manager._cpu_prefetch_dma_stream.synchronize.assert_called_once()
+    dma_stream.synchronize.assert_called_once()
     manager._prefetch_stream.synchronize.assert_not_called()
     assert manager._retired_expert_h2d_views == [concurrent_retirement]
     manager.close()
@@ -152,8 +144,6 @@ def test_prefetch_reads_current_ids_once_and_rebuilds_current_mapping():
     manager.cache_policy = None
     manager.num_total_experts = 4
     manager.prefetch_topk = 1
-    manager._prefetch_trace = SimpleNamespace(mark=MagicMock())
-    manager._cpu_prefetch_dispatcher = None
     manager.load_stream = object()
     manager._load_expert_weights_into_slots = MagicMock()
     manager._synchronize_h2d = MagicMock()

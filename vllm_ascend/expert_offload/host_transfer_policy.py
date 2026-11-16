@@ -5,11 +5,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from math import lcm
 
-from .frequency_transfer_policy import (
-    FREQUENCY_DECAY,
-    FREQUENCY_MIN_SCORE,
-    FREQUENCY_REPLACEMENT_RATIO,
-)
+FREQUENCY_DECAY = 0.99
 
 
 @dataclass(frozen=True)
@@ -23,16 +19,23 @@ class HostTransferPlan:
 class HostTransferPolicy:
     """One planner per layer; only the input-poll producer mutates its state."""
 
-    def __init__(self, *, experts, slots, config, lrc=None, layer_idx=0):
+    def __init__(self, *, experts, slots, config, lrc=None, layer_idx=0, costs=None):
         self.experts, self.slots = experts, slots
         self.config, self.lrc, self.layer_idx = config, lrc, layer_idx
         self.scores = [0.0] * experts
-        cpu = Fraction(str(config.balance_cpu_expert_us))
-        copy = Fraction(str(config.balance_copy_us))
+        if costs is None:
+            cpu = Fraction(str(config.balance_cpu_expert_us))
+            extra = cpu
+            copy = Fraction(str(config.balance_copy_us))
+        else:
+            cpu = Fraction(costs.first_route_ns, 1000)
+            extra = Fraction(costs.extra_route_ns, 1000)
+            copy = Fraction(costs.copy_expert_ns, 1000)
         self.ratio = cpu / (cpu + copy)
         fixed = Fraction(str(getattr(config, "balance_npu_fixed_us", 0.0)))
-        scale = lcm(cpu.denominator, copy.denominator, fixed.denominator)
+        scale = lcm(cpu.denominator, extra.denominator, copy.denominator, fixed.denominator)
         self.cpu_unit = int(cpu * scale)
+        self.cpu_extra_unit = int(extra * scale)
         self.copy_unit = int(copy * scale)
         self.npu_fixed_unit = int(fixed * scale)
 
@@ -64,39 +67,27 @@ class HostTransferPolicy:
         else:
             cold.sort(key=lambda e: (self.scores[e], e))
         targets = free + [mapping[e] for e in cold]
-        policy = self.config.transfer_policy
-        if policy == "load_balance":
-            missing.sort(key=lambda e: (-counts[e], -self.scores[e], e))
-            # Each expert-token pair is CPU work; each expert weight is copied
-            # once, regardless of how many tokens selected it. Evaluate all
-            # frequency-ranked prefixes and minimize the parallel makespan.
-            remaining_routes = sum(counts[e] for e in missing)
-            cpu_unit, copy_unit = self.cpu_unit, self.copy_unit
-            # One whole-layer NPU compute estimate, including the k=0 baseline.
-            best_cost = max(remaining_routes * cpu_unit, self.npu_fixed_unit)
-            n = 0
-            limit = min(len(missing), len(targets), self.config.balance_max_transfers)
-            for copied in range(1, limit + 1):
-                remaining_routes -= counts[missing[copied - 1]]
-                cost = max(remaining_routes * cpu_unit, copied * copy_unit + self.npu_fixed_unit)
-                # Equal makespan keeps the smaller transfer count.
-                if cost < best_cost:
-                    best_cost, n = cost, copied
-        elif policy == "frequency":
-            # Stable input order breaks equal-frequency ties, as on device.
-            missing.sort(key=lambda e: -self.scores[e])
-            n = 1
-        else:
-            n = 1
+        missing.sort(key=lambda e: (-counts[e], -self.scores[e], e))
+        cpu_unit, copy_unit = self.cpu_unit, self.copy_unit
+        # First use and additional tokens have different CPU costs. With
+        # uniform copy cost, descending multiplicity still maximizes savings
+        # for each candidate number of uploads.
+        cpu_costs = [cpu_unit + (counts[e] - 1) * self.cpu_extra_unit for e in missing]
+        remaining_cpu = sum(cpu_costs)
+        # One whole-layer NPU compute estimate, including the k=0 baseline.
+        best_cost = max(remaining_cpu, self.npu_fixed_unit)
+        n = 0
+        limit = min(len(missing), len(targets), self.config.balance_max_transfers)
+        for copied, saved_cpu in enumerate(cpu_costs[:limit], start=1):
+            remaining_cpu -= saved_cpu
+            cost = max(remaining_cpu, copied * copy_unit + self.npu_fixed_unit)
+            # Equal makespan keeps the smaller transfer count.
+            if cost < best_cost:
+                best_cost, n = cost, copied
         loads = []
         updated = list(mapping)
         for eid, slot in zip(missing[:n], targets):
             victim = owners.get(slot)
-            if policy == "frequency":
-                demand = self.scores[eid]
-                old = self.scores[victim] if victim is not None else 0.0
-                if demand < FREQUENCY_MIN_SCORE or demand <= old * FREQUENCY_REPLACEMENT_RATIO:
-                    continue
             if victim is not None:
                 updated[victim] = -1
             updated[eid] = slot

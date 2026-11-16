@@ -1,5 +1,4 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -9,7 +8,6 @@ from vllm_ascend.expert_offload.h2d_transfer import H2DCopyTask, TorchCopyH2DTra
 
 def make_manager(events, fail=False):
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._prefetch_trace = MagicMock()
     manager._get_h2d_transport = lambda: TorchCopyH2DTransport()
 
     def build(layer, layer_idx, eid, slot):

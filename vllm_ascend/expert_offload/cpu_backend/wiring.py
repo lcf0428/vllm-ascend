@@ -1,15 +1,4 @@
-"""Model-load-time wiring for the CPU routed-expert backend.
-
-This is the only place that turns a ``CpuMoeConfig`` into an attached
-executor.  It lives beside the backend rather than in ``hybrid_executor``
-(which owns the contract and must stay importable without kt-kernel) or inside
-``kt_kernel_backend`` (which owns a single layer's adapter).
-
-Attachment happens once per MoE layer during ``AscendMoERunner.__init__``,
-after the static resident map (``log2phy``) has been built.  That ordering is
-load-bearing: the executor derives its CPU/NPU split from ``log2phy`` on every
-step, so the map must be final before anything reads it.
-"""
+"""Attach CPU MoE after the shared NZ buffers have been prepared."""
 
 from __future__ import annotations
 
@@ -25,23 +14,14 @@ from .kt_kernel_backend import KtKernelBackendConfig, KtKernelCPUExpertBackend
 
 
 def model_layer_index(layer_name: str) -> int:
-    """Resolve the MODEL layer index from a vLLM layer name.
-
-    ``cpu_moe.layers`` and the GGUF ``blk.{layer_idx}`` prefix share the model
-    layer namespace, which is *not* the MoE registration ordinal
-    (``moe_instance_id``): models interleave dense layers with MoE ones, so the
-    two indices diverge after the first dense block.  The layer name is the
-    only place the model index survives to construction time.
-    """
+    """Resolve the model layer index, which may differ from the MoE ordinal."""
     from vllm.model_executor.models.utils import extract_layer_index
 
     try:
         return int(extract_layer_index(layer_name))
     except (AssertionError, ValueError, IndexError) as exc:
         raise ValueError(
-            "cpu_moe.layers is expressed in MODEL layer indices, which are "
-            "parsed from the layer name, but none could be parsed from "
-            f"{layer_name!r}"
+            f"Cannot resolve the CPU MoE model layer index from {layer_name!r}"
         ) from exc
 
 
@@ -55,15 +35,7 @@ def maybe_attach_cpu_expert_backend(
     tp_size: int,
     native_weights=None,
 ) -> CPUExpertBackend | None:
-    """Attach a kt-kernel backend when CPU/NPU hybrid owns this layer.
-
-    Returns ``None`` whenever hybrid is off or this layer is not selected; the
-    caller then keeps the untouched weight-paging path.  Misconfiguration that
-    would otherwise fail silently raises here instead -- a layer that pages
-    experts in while a CPU backend also owns its routes would let the paging
-    rewrite ``log2phy`` out from under the executor, and the two halves would
-    then disagree about which side owns a route.
-    """
+    """Attach the CPU backend for a registered MoE layer."""
     if not cpu_moe_config.enabled:
         return None
 
@@ -72,8 +44,6 @@ def maybe_attach_cpu_expert_backend(
         return existing.backend
 
     model_layer_idx = model_layer_index(layer_name)
-    if not cpu_moe_config.includes(model_layer_idx):
-        return None
 
     # Hybrid supports single-card decode and DSpark verification.  Refuse the rest loudly rather than
     # attaching a backend whose routes would never reach it.
@@ -85,31 +55,24 @@ def maybe_attach_cpu_expert_backend(
             f"ep_size={moe_config.ep_size}"
         )
 
+    affinity = getattr(cpu_moe_config, "startup_affinity", None)
+    if affinity is None:
+        raise RuntimeError("Resolve CPU MoE affinity before attaching the CPU backend")
     config = KtKernelBackendConfig(
-        # The MODEL layer index, matching both cpu_moe.layers and the GGUF
-        # blk.{layer_idx} prefix.  kt-kernel's per-layer GGUFs are written in
-        # logical expert order, so its identity expert mapping is correct here.
         layer_idx=model_layer_idx,
-        native_dispatch=getattr(cpu_moe_config, "native_dispatch", False),
-        # Every expert lives in the CPU-side GGUF; which of them actually
-        # compute on CPU is decided per step from log2phy, not here.
         num_experts=moe_config.num_logical_experts,
         top_k=moe_config.experts_per_token,
         hidden_size=moe_config.hidden_dim,
         intermediate_size=moe_config.intermediate_size_per_partition,
-        weight_path=cpu_moe_config.weight_path,
-        weight_format=cpu_moe_config.weight_format,
-        cpuinfer_threads=cpu_moe_config.cpuinfer_threads,
+        cpuinfer_threads=sum(map(len, affinity.compute_cpus)),
         threadpool_count=cpu_moe_config.threadpool_count,
         max_num_tokens=cpu_moe_config.max_num_tokens,
-        numa_nodes=cpu_moe_config.numa_nodes,
+        numa_nodes=affinity.numa_nodes,
+        compute_cpus=affinity.compute_cpus,
+        poll_cpu=affinity.poll_cpu,
+        completion_cpu=affinity.completion_cpu,
     )
-    if config.weight_format == "nz_mxfp4":
-        if native_weights is None:
-            raise RuntimeError("Native CPU backend must borrow the offload manager's loaded weight owner")
-        backend = KtKernelCPUExpertBackend(config, native_weights=native_weights)
-    else:
-        backend = KtKernelCPUExpertBackend(config)
+    backend = KtKernelCPUExpertBackend(config, native_weights=native_weights)
     # Both sides take the model layer index: submit() cross-checks the index it
     # is handed against config.layer_idx and raises on a mismatch.
     attach_hybrid_expert_executor(routed_experts, backend, model_layer_idx)
@@ -120,42 +83,42 @@ __all__ = ["maybe_attach_cpu_expert_backend", "model_layer_index"]
 
 
 def attach_or_defer_cpu_expert_backend(manager, **kwargs):
-    """Allocate DMA storage before faulting/copying the GGUF working set.
-
-    Explicit host-weight NUMA placement opts into this startup ordering.
-    Finalization runs before profiling/capture; layers added later attach
-    immediately. Execution ownership and kernel math are unchanged.
-    """
-    cpu = kwargs["cpu_moe_config"]
-    if (cpu.enabled and (cpu.weight_format == "nz_mxfp4" or (
-            cpu.weight_format == "gguf" and getattr(cpu, "host_weight_numa_node", None) is not None))
-            and not getattr(manager, "_cpu_weights_finalized", False)):
-        pending = getattr(manager, "_pending_cpu_backend_attachments", None)
-        if pending is None:
-            pending = manager._pending_cpu_backend_attachments = []
-        if not any(item["routed_experts"] is kwargs["routed_experts"] for item in pending):
-            pending.append(kwargs)
+    """Queue eligible layers until their shared DMA storage is verified."""
+    if not kwargs["cpu_moe_config"].enabled:
         return None
-    return maybe_attach_cpu_expert_backend(**kwargs)
+    if getattr(manager, "_cpu_weights_finalized", False):
+        raise RuntimeError("CPU MoE layers must register before NZ weight finalization")
+    pending = getattr(manager, "_pending_cpu_backend_attachments", None)
+    if pending is None:
+        pending = manager._pending_cpu_backend_attachments = []
+    if not any(item["routed_experts"] is kwargs["routed_experts"] for item in pending):
+        pending.append(kwargs)
 
 
 def finalize_deferred_cpu_backends(manager):
-    """Load all deferred CPU weights before any graph can use the model."""
-    manager._cpu_weights_finalized = True
+    """Attach all registered MoE layers to their verified NZ weight owners."""
+    if getattr(manager, "_cpu_weights_finalized", False):
+        return 0
     pending = getattr(manager, "_pending_cpu_backend_attachments", [])
+    if {id(item["routed_experts"]) for item in pending} != {id(layer) for layer in manager.moe_layers}:
+        raise RuntimeError("CPU MoE requires a pending backend for every registered MoE layer")
+    if not getattr(manager, "_nz_cpu_layout_ready", False):
+        raise RuntimeError("NZ CPU cannot attach before physical weight conversion")
+
+    from kt_kernel.utils.nz_mxfp4 import NZWeights
+
     for kwargs in pending:
-        if kwargs["cpu_moe_config"].weight_format == "nz_mxfp4":
-            if not getattr(manager, "_nz_cpu_layout_ready", False):
-                raise RuntimeError("NZ CPU cannot attach before physical weight conversion")
-            from kt_kernel.utils.nz_mxfp4 import NZWeights
-            layer_idx = manager.moe_layers.index(kwargs["routed_experts"])
-            if layer_idx not in getattr(manager, "_nz_cpu_layout_verified", set()):
-                raise RuntimeError("NZ CPU requires verified physical NZ source bytes")
-            kwargs["native_weights"] = NZWeights(
-                tuple(manager.w13_weights_cpu[layer_idx]), tuple(manager.w2_weights_cpu[layer_idx]),
-                tuple(manager.scale_cpu_buffers["w13_weight_scale"][layer_idx]),
-                tuple(manager.scale_cpu_buffers["w2_weight_scale"][layer_idx]))
-        maybe_attach_cpu_expert_backend(**kwargs)
+        layer_idx = manager.moe_layers.index(kwargs["routed_experts"])
+        if layer_idx not in manager._nz_cpu_layout_verified:
+            raise RuntimeError("NZ CPU requires verified physical NZ source bytes")
+        native_weights = NZWeights(
+            tuple(manager.w13_weights_cpu[layer_idx]),
+            tuple(manager.w2_weights_cpu[layer_idx]),
+            tuple(manager.scale_cpu_buffers["w13_weight_scale"][layer_idx]),
+            tuple(manager.scale_cpu_buffers["w2_weight_scale"][layer_idx]),
+        )
+        maybe_attach_cpu_expert_backend(**kwargs, native_weights=native_weights)
     count = len(pending)
     pending.clear()
+    manager._cpu_weights_finalized = True
     return count

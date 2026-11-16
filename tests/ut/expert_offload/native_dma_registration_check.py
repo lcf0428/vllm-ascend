@@ -29,16 +29,17 @@ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 worker=module.NativePollWorker(0);dma=Stream();manager=NS(_prepared_expert_h2d={});owners=[]
 class Plan:
  native_dma_live=False
+ fields=[(None,None,None,name) for name in ('w13','w2','w13_weight_scale','w2_weight_scale')]
  def __init__(self):
   self.src=torch.arange(256,dtype=torch.int32).reshape(4,64);self.dst=torch.zeros((1,64),dtype=torch.int32)
- def native_dma_table(self):return [[x.data_ptr() for x in self.src]],[[self.dst[0].data_ptr()]],[256],4,1
+ def native_dma_table(self):return [[x.data_ptr() for x in self.src]]*4,[[self.dst[0].data_ptr()]]*4,[256]*4,4,1
 class Context:
  def before_submit(self):pass
 try:
  for prefetch in (False,True):
   index=int(prefetch);plan=Plan();manager._prepared_expert_h2d[index]=plan
   from _vllm_ascend_lrc import NativeHostPlanner
-  planner=NativeHostPlanner(4,1,index,0,1,1,'first_miss',None,[0.]*4)
+  planner=NativeHostPlanner(4,1,index,2,3,1,None,[0.]*4)
   dest_mapping=torch.tensor([0,-1,-1,-1],dtype=torch.int32)
   transfer=NS(worker=NS(manager=manager,stream=dma),layer_idx=index,layer=NS(log2phy=dest_mapping),native_dma_cpu=31,native_planner=planner)
   context=Context();context.transfer=transfer;context.mapping=dest_mapping.clone();context.ready=Event()
@@ -46,7 +47,7 @@ try:
   if not prefetch:
    batches=torch.tensor([1],dtype=torch.int32)
    Buffers.get_buffer=staticmethod(lambda *args:([hidden],[ids],None,[weights],[hidden],[batches],None))
-   backend=NS(config=NS(top_k=1,layer_idx=0),_wrapper=NS(max_deferred_experts_per_token=0,layer_idx=0,cpu_infer=1,moe=NS(forward_task=lambda *args:(fixture.entry(),fixture.address(task)))))
+   backend=NS(config=NS(top_k=1,layer_idx=0),_wrapper=NS(max_deferred_experts_per_token=0,layer_idx=0,cpu_infer=1,moe=NS(weight_pointers=lambda:plan.native_dma_table()[0],forward_task=lambda *args:(fixture.entry(),fixture.address(task)))))
    worker.register(backend,hidden,None,done,flag,context.before_submit)
    assert context.native_channel==0
   else:

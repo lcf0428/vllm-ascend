@@ -1750,51 +1750,20 @@ class SparseKVOffloadConfig:
 
 
 class CpuMoeConfig:
-    """
-    Configuration Object for expert_offload_config.cpu_moe from additional_config
-
-    Selects which MoE layers get a kt-kernel CPU routed-expert backend attached
-    at model-load time.  ``enabled=False`` (the default) leaves the existing
-    weight-paging offload path completely untouched: no backend is constructed,
-    no GGUF is opened, and ``get_hybrid_expert_executor()`` keeps returning
-    ``None`` for every layer.
-
-    The indices in ``layers`` are MODEL layer indices -- the same namespace as
-    the GGUF ``blk.{layer_idx}`` prefix -- NOT the MoE registration ordinal that
-    ``num_device_experts`` and the other per-layer offload arrays use.
-    """
+    """CPU execution for every eligible MoE layer using shared NZ weights."""
 
     _defaults = {
         "enabled": False,
-        # Only the ktransformers LLAMAFILE MoE wrapper is implemented today.
-        "backend": "kt_kernel",
-        "weight_format": "gguf",  # nz_mxfp4 borrows finalized DMA sources
-        # Per-layer GGUF template, literal or containing "{layer_idx}".
-        # Expanded per layer by KtKernelBackendConfig.resolved_weight_path().
-        "weight_path": "",
-        # "all", or an explicit list of MODEL layer indices.
-        "layers": "all",
-        "cpuinfer_threads": 32,
+        "cpuinfer_threads": None,  # Resolve available physical cores at worker startup.
         # Each thread pool is bound to one NUMA node, so this must not exceed
         # the host NUMA node count.
         "threadpool_count": 1,
         "max_num_tokens": 1,
         "numa_nodes": None,
-        # When a retained routed expert misses NPU residency,
-        # transfer exactly one to NPU while the CPU computes the remainder.
-        # first_miss preserves the original policy; frequency admits recent hotspots.
-        "transfer_policy": "first_miss",
-        "transfer_scheduler": "cpu",
-        # Register graph tasks once; CPU poll/submit/completion run without Python.
-        "native_dispatch": False,
-        # Dedicated DMA logical CPU; None uses the existing completion CPU.
+        # Dedicated DMA logical CPU; None reserves one automatically.
         "native_dispatch_dma_cpu": None,
-        # NUMA placement of NPU DMA source weight/quant buffers only.
-        # CPU expert GGUF weights and compute pools still use numa_nodes.
+        # NUMA placement of the shared weights; None follows the compute node.
         "host_weight_numa_node": None,
-        "transfer_copy_library": "",
-        "transfer_trace_capacity": 0,
-        "transfer_trace_mode": 1,
         # Initial minimax model in microseconds; tune from per-layer measurements.
         "balance_max_transfers": 32,
         "balance_cpu_expert_us": 70.0,
@@ -1817,7 +1786,6 @@ class CpuMoeConfig:
                     self.config[key] = value
                 else:
                     raise ValueError(f"Config has no attribute '{key}'")
-        self.config["layers"] = self._normalize_layers(self.config["layers"])
         self.config["numa_nodes"] = self._normalize_numa_nodes(
             self.config["numa_nodes"])
         self._validate_config()
@@ -1826,38 +1794,6 @@ class CpuMoeConfig:
         if key in self.config:
             return self.config[key]
         raise AttributeError(f"Config has no attribute '{key}'")
-
-    @staticmethod
-    def _normalize_layers(value):
-        """Return "all" or a sorted tuple of unique model layer indices.
-
-        ``None`` means "all", matching a config that omits the key entirely.
-        """
-        if value is None or value == "all":
-            return "all"
-        if isinstance(value, str):
-            raise ValueError(
-                "cpu_moe.layers must be 'all' or a list of model layer "
-                f"indices; got {value!r}")
-        if isinstance(value, (list, tuple)):
-            if not value:
-                raise ValueError(
-                    "cpu_moe.layers must not be empty; use 'all' to select "
-                    "every MoE layer")
-            indices: set[int] = set()
-            for item in value:
-                if isinstance(item, bool) or not isinstance(item, int):
-                    raise TypeError(
-                        "cpu_moe.layers entries must be integers; got "
-                        f"{item!r}")
-                if item < 0:
-                    raise ValueError(
-                        f"cpu_moe.layers entries must be >= 0; got {item}")
-                indices.add(item)
-            return tuple(sorted(indices))
-        raise TypeError(
-            "cpu_moe.layers must be 'all' or a list of model layer indices; "
-            f"got {type(value).__name__}")
 
     @staticmethod
     def _normalize_numa_nodes(value):
@@ -1879,46 +1815,15 @@ class CpuMoeConfig:
             nodes.append(node)
         return tuple(nodes)
 
-    def includes(self, model_layer_idx: int) -> bool:
-        """Whether hybrid execution is on AND this MODEL layer is selected."""
-        if not self.config["enabled"]:
-            return False
-        if self.layers == "all":
-            return True
-        return model_layer_idx in self.layers
-
     def _validate_config(self):
         if not isinstance(self.config["enabled"], bool):
             raise TypeError("cpu_moe.enabled must be a boolean")
-        capacity = self.config["transfer_trace_capacity"]
-        if isinstance(capacity, bool) or not isinstance(capacity, int) or not 0 <= capacity <= 4096:
-            raise ValueError("cpu_moe.transfer_trace_capacity must be an integer in [0,4096]")
-        mode = self.config["transfer_trace_mode"]
-        if isinstance(mode, bool) or not isinstance(mode, int) or mode not in (1, 2):
-            raise ValueError("cpu_moe.transfer_trace_mode must be 1 (field) or 2 (per-tile)")
-        if capacity and self.config["transfer_scheduler"] != "npu":
-            raise ValueError("Transfer trace requires the NPU scheduler")
-        if self.config["transfer_scheduler"] not in ("cpu", "npu"):
-            raise ValueError("cpu_moe.transfer_scheduler must be cpu or npu")
-        if not isinstance(self.config["native_dispatch"], bool):
-            raise ValueError("cpu_moe.native_dispatch must be boolean")
         dma_cpu = self.config["native_dispatch_dma_cpu"]
         if dma_cpu is not None and (isinstance(dma_cpu, bool) or not isinstance(dma_cpu, int) or dma_cpu < 0):
             raise ValueError("native_dispatch_dma_cpu must be a non-negative CPU index or None")
         host_node = self.config["host_weight_numa_node"]
         if host_node is not None and (isinstance(host_node, bool) or not isinstance(host_node, int) or host_node < 0):
             raise ValueError("host_weight_numa_node must be a non-negative NUMA index or None")
-        if self.config["enabled"] and self.config["transfer_scheduler"] != "cpu":
-            raise ValueError("CPU MoE now uses host admission/DMA; set transfer_scheduler=cpu")
-        if self.config["transfer_scheduler"] == "npu" and not self.config["transfer_copy_library"]:
-            from vllm_ascend.expert_offload.copy_library import get_default_copy_library
-
-            self.config["transfer_copy_library"] = get_default_copy_library()
-        if self.config["transfer_policy"] not in ("first_miss", "frequency", "load_balance"):
-            raise ValueError("cpu_moe.transfer_policy must be first_miss, frequency or load_balance")
-        if self.config["transfer_policy"] == "load_balance":
-            if self.config["transfer_trace_capacity"]:
-                raise ValueError("Per-core transfer tracing supports single-expert policies only")
         limit = self.config["balance_max_transfers"]
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
             raise ValueError("cpu_moe.balance_max_transfers must be an integer in [1,32]")
@@ -1928,23 +1833,16 @@ class CpuMoeConfig:
                 raise ValueError(f"cpu_moe.{key} must be finite and nonnegative")
         if self.config["balance_cpu_expert_us"] == 0 or self.config["balance_copy_us"] == 0:
             raise ValueError("CPU expert and copy costs must be positive")
-        if self.config["backend"] not in ("kt_kernel", ):
-            raise ValueError("cpu_moe.backend must be 'kt_kernel'; got "
-                             f"{self.config['backend']!r}")
-        if self.config["weight_format"] not in ("gguf", "nz_mxfp4"):
-            raise ValueError("cpu_moe.weight_format must be gguf or nz_mxfp4")
-        if self.config["weight_format"] == "nz_mxfp4" and not self.config["native_dispatch"]:
-            raise ValueError("Shared NZ CPU requires native_dispatch=true")
-        if self.config["weight_format"] == "nz_mxfp4" and self.config["threadpool_count"] != 1:
-            raise ValueError("Shared NZ CPU requires one NUMA pool")
-        if not isinstance(self.config["weight_path"], str):
-            raise TypeError("cpu_moe.weight_path must be a string")
         for key in ("cpuinfer_threads", "threadpool_count", "max_num_tokens"):
             value = self.config[key]
+            if key == "cpuinfer_threads" and value is None:
+                continue
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"cpu_moe.{key} must be an integer")
             if value <= 0:
                 raise ValueError(f"cpu_moe.{key} must be positive; got {value}")
+        if self.enabled and self.cpuinfer_threads is not None and self.cpuinfer_threads < self.threadpool_count:
+            raise ValueError("cpu_moe.cpuinfer_threads must be >= cpu_moe.threadpool_count")
         numa_nodes = self.config["numa_nodes"]
         if numa_nodes is not None and len(
                 numa_nodes) != self.config["threadpool_count"]:
@@ -1952,25 +1850,8 @@ class CpuMoeConfig:
                 "cpu_moe.numa_nodes must contain one node per thread pool; "
                 f"got nodes={len(numa_nodes)}, "
                 f"threadpool_count={self.config['threadpool_count']}")
-        # Everything below only matters once the user opts in: a disabled
-        # sub-config must never reject an otherwise-valid expert_offload_config.
-        if not self.config["enabled"]:
-            return
-        weight_path = self.config["weight_path"]
-        if not weight_path and self.config["weight_format"] != "nz_mxfp4":
-            raise ValueError(
-                "cpu_moe.weight_path must not be empty when "
-                "cpu_moe.enabled=True")
-        # A template without {layer_idx} would load ONE layer's GGUF into every
-        # selected layer -- silently wrong numerics, so reject it whenever more
-        # than one layer can be selected. A literal path is fine for a
-        # single-element list.
-        multiple = self.layers == "all" or len(self.layers) > 1
-        if multiple and self.config["weight_format"] == "gguf" and "{layer_idx}" not in weight_path:
-            raise ValueError(
-                "cpu_moe.weight_path must contain the '{layer_idx}' "
-                "placeholder when cpu_moe.layers selects more than one layer; "
-                f"got {weight_path!r}")
+        if self.enabled and self.threadpool_count != 1:
+            raise ValueError("Shared NZ CPU requires one NUMA pool")
 
 
 class ExpertOffloadConfig:

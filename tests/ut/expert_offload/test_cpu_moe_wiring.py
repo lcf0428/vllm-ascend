@@ -25,13 +25,35 @@ def cpu_config_class():
 def test_cpu_config_disabled_by_default(cpu_config_class):
     cfg = cpu_config_class()
     assert not cfg.enabled
-    assert not cfg.includes(0)
+    assert cfg.cpuinfer_threads is None
+    assert cfg.numa_nodes is None
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("backend", "kt_kernel"),
+    ("layers", [999]),
+    ("weight_path", "/unused/{layer_idx}.gguf"),
+    ("weight_format", "gguf"),
+    ("native_dispatch", False),
+    ("transfer_policy", "load_balance"),
+    ("transfer_scheduler", "cpu"),
+])
+def test_cpu_moe_rejects_retired_options(cpu_config_class, key, value):
+    config = {"enabled": True}
+    assert cpu_config_class(config).enabled
+    with pytest.raises(ValueError, match=f"Config has no attribute '{key}'"):
+        cpu_config_class({**config, key: value})
 
 
 @pytest.mark.parametrize("capacity", [0, -1, True, "6"])
 def test_cpu_config_rejects_invalid_capacity(cpu_config_class, capacity):
     with pytest.raises((TypeError, ValueError)):
         cpu_config_class({"max_num_tokens": capacity})
+
+
+def test_cpu_config_rejects_empty_threadpool(cpu_config_class):
+    with pytest.raises(ValueError, match="cpuinfer_threads must be >= cpu_moe.threadpool_count"):
+        cpu_config_class({"enabled": True, "cpuinfer_threads": 1, "threadpool_count": 2})
 
 
 @pytest.mark.parametrize("capacity", [10, 12, 16])
@@ -45,13 +67,16 @@ def test_wiring_checks_verify_capacity_before_backend_creation(cpu_config_class,
     monkeypatch.setattr(wiring, "model_layer_index", lambda _: 3)
     created = []
 
-    def factory(config):
+    def factory(config, *, native_weights):
         created.append(config)
         return SimpleNamespace(max_num_tokens=config.max_num_tokens, submit=lambda **_: None)
 
     monkeypatch.setattr(wiring, "KtKernelCPUExpertBackend", factory)
     cfg = cpu_config_class(
-        {"enabled": True, "layers": [3], "weight_path": "/unused/layer3.gguf", "max_num_tokens": capacity}
+        {"enabled": True, "max_num_tokens": capacity}
+    )
+    cfg.startup_affinity = SimpleNamespace(
+        compute_cpus=((3, 7),), numa_nodes=(2,), poll_cpu=10, completion_cpu=11,
     )
     args = dict(
         routed_experts=torch.nn.Module(),
@@ -63,14 +88,18 @@ def test_wiring_checks_verify_capacity_before_backend_creation(cpu_config_class,
         enable_multi_card=False,
         tp_size=1,
     )
-    assert wiring.maybe_attach_cpu_expert_backend(**args).max_num_tokens == capacity
+    assert wiring.maybe_attach_cpu_expert_backend(**args, native_weights=object()).max_num_tokens == capacity
     assert len(created) == 1
+    assert (created[0].poll_cpu, created[0].completion_cpu) == (10, 11)
+    assert created[0].cpuinfer_threads == 2
+    assert created[0].compute_cpus == ((3, 7),)
+    assert created[0].numa_nodes == (2,)
 
 
 @pytest.mark.parametrize("tp, ep, multi_card", [(2, 1, False), (1, 2, False), (1, 1, True)])
 def test_wiring_retains_single_card_constraint(cpu_config_class, monkeypatch, tp, ep, multi_card):
     monkeypatch.setattr(wiring, "model_layer_index", lambda _: 3)
-    cfg = cpu_config_class({"enabled": True, "layers": [3], "weight_path": "/unused/layer3.gguf"})
+    cfg = cpu_config_class({"enabled": True})
     with pytest.raises(ValueError, match="single-card"):
         wiring.maybe_attach_cpu_expert_backend(
             routed_experts=torch.nn.Module(),
@@ -80,30 +109,3 @@ def test_wiring_retains_single_card_constraint(cpu_config_class, monkeypatch, tp
             enable_multi_card=multi_card,
             tp_size=tp,
         )
-
-
-def test_npu_transfer_resolves_checkout_copy_library(cpu_config_class, monkeypatch):
-    import vllm_ascend.expert_offload.copy_library as library
-
-    monkeypatch.setattr(library, "get_default_copy_library", lambda: "/checkout/default-copy.so")
-    cfg = cpu_config_class({"transfer_scheduler": "npu"})
-    assert cfg.transfer_copy_library == "/checkout/default-copy.so"
-
-
-def test_npu_transfer_preserves_explicit_library(cpu_config_class, monkeypatch):
-    import vllm_ascend.expert_offload.copy_library as library
-
-    def unexpected_default():
-        raise AssertionError("Explicit copy library must bypass default resolution")
-
-    monkeypatch.setattr(library, "get_default_copy_library", unexpected_default)
-    cfg = cpu_config_class({"transfer_scheduler": "npu", "transfer_copy_library": "/custom/copy.so"})
-    assert cfg.transfer_copy_library == "/custom/copy.so"
-
-
-def test_missing_checkout_copy_library_has_build_instruction(monkeypatch, tmp_path):
-    import vllm_ascend.expert_offload.copy_library as library
-
-    monkeypatch.setattr(library, "__file__", str(tmp_path / "copy_library.py"))
-    with pytest.raises(FileNotFoundError, match="csrc/expert_transfer_copy/build.sh"):
-        library.get_default_copy_library()

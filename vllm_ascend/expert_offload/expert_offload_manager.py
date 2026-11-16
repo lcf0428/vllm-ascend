@@ -17,9 +17,6 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import (
-    CpuPrefetchTrace, NullCpuPrefetchTrace, Phase as CpuPrefetchPhase,
-)
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
 from vllm_ascend.expert_offload.h2d_transfer import (
@@ -165,7 +162,7 @@ class ExpertOffloadManager:
 
         self.offload_config = get_ascend_config().expert_offload_config
         cpu = self.offload_config.cpu_moe
-        self._host_hybrid_enabled = cpu.enabled and cpu.transfer_scheduler == "cpu"
+        self._host_hybrid_enabled = cpu.enabled
         self._host_weight_worker = None
         # Honor the requested prefetch setting. Host demand admission joins
         # the target's prefetch event before reading residency or publishing
@@ -184,7 +181,6 @@ class ExpertOffloadManager:
                 # actually observed (prefetch benefit included) — the metric the
                 # ablation compares across prefetch on/off runs.
                 logger.warning("[BENCH-ROUTE-STATS] expert_prefetch_enabled=True: hit rates are effective (include prefetch-migrated experts)")
-        cpu_config = self.offload_config.cpu_moe
         # The minimum capacity is the conservative global dispatch threshold;
         # actual weight and placement sizes are resolved per MoE layer.
         self.num_device_experts = min(self.offload_config.num_device_experts_list)
@@ -397,26 +393,6 @@ class ExpertOffloadManager:
         """Next-layer expert-prefetch infrastructure init."""
         # Next-layer expert prefetch infrastructure
         self._prefetch_stream = torch_npu.npu.Stream()
-        self._device_prefetch_candidates = {}
-        self._device_prefetch_graph_refs = []
-        self._device_prefetch_init_ready = None
-        self._cpu_prefetch_dispatcher = None
-        self._cpu_prefetch_dma_stream = None
-        # CPU-MoE diagnostics are optional. The ordinary offload path must not
-        # load a machine-specific shared object just because the manager owns
-        # the common prefetch state.
-        self._prefetch_trace = NullCpuPrefetchTrace()
-        if self.offload_config.cpu_moe.enabled:
-            try:
-                self._prefetch_trace = CpuPrefetchTrace(
-                    library_path="/mnt/sdc/y50063808/cpu_dma_dispatch_20261025/libcpu_prefetch_diag.so",
-                    output_root="/mnt/sdc/y50063808/cpu_dma_dispatch_20261025",
-                )
-            except (OSError, ImportError, AttributeError) as exc:
-                logger.warning(
-                    "[PREFETCH-CPU-DIAG] unavailable; continuing without CPU trace: %s",
-                    exc,
-                )
         # NPU copy of gate weights for graph-capturable on-device prediction
         # (predict_next_layer_experts_npu). Kept in fp32.
         self._gate_weights_npu: list[torch.Tensor | None] = []
@@ -760,6 +736,8 @@ class ExpertOffloadManager:
         registration.
         """
         if not self.moe_layers:
+            if self._host_hybrid_enabled:
+                raise ValueError("CPU MoE is enabled but no eligible MXFP4 MoE layers were registered")
             return
         # Barrier: ensure all deferred load_w13/load_w2/_load_scale_shard
         # copies have landed before process_weights_after_loading reads them.
@@ -924,10 +902,6 @@ class ExpertOffloadManager:
             # recorded and the model geometry is only known once the model exists.
             if self.expert_predictor is not None:
                 self.expert_predictor.finalize(model)
-            # Build device-owned candidates after all weight/NZ pointer tables,
-            # hot preload, gate buffers, and CPU hybrid executors are ready,
-            # but before any graph capture can record a replay.
-            self._init_device_prefetch()
             if self._pf_wait_timing:
                 # One pair per MoE layer, allocated ONCE and re-recorded every
                 # step. Creating them per call would add 2 events per layer per
@@ -972,37 +946,6 @@ class ExpertOffloadManager:
                         "unaffected.",
                         exc_info=True,
                     )
-        # CPU-MoE diagnostics and the optional ready-poll worker are strictly
-        # opt-in. With CPU-MoE disabled the original host prefetch/DMA path is
-        # left alone, including its callback scheduling and transport.
-        if self.offload_config.cpu_moe.enabled and not self._host_hybrid_enabled:
-            # Mapped addresses and descriptor buffers must be final before
-            # profiling and capture. In particular, device format conversion
-            # may replace w.data.
-            if self._device_prefetch_candidates:
-                logger.info("[PREFETCH-CPU-DMA] device candidates armed=%d; native poll/Event worker uses original CPU copy_ DMA",
-                            len(self._device_prefetch_candidates))
-            else:
-                logger.info("[PREFETCH-CPU-DMA] no device candidates; host prefetch path remains active")
-            for moe_layer in self.moe_layers:
-                executor = getattr(moe_layer, "_hybrid_expert_executor", None)
-                if executor is not None:
-                    executor.backend._cpu_prefetch_trace = self._prefetch_trace
-            dma_transport = self._get_h2d_transport()
-            if isinstance(dma_transport, TorchCopyH2DTransport):
-                dma_transport._cpu_prefetch_trace = self._prefetch_trace
-            logger.info("[PREFETCH-CPU-DIAG] enabled: %s", self._prefetch_trace.path)
-            from vllm_ascend.expert_offload.cpu_prefetch_dispatch import create_manager_dispatcher
-            self._cpu_prefetch_dispatcher = create_manager_dispatcher(
-                self,
-                library_path="/mnt/sdc/y50063808/cpu_dma_dispatch_20261025/libcpu_prefetch_ready_poll.so",
-            )
-            if self._cpu_prefetch_dispatcher is not None:
-                self._cpu_prefetch_dma_stream = self._cpu_prefetch_dispatcher.dma_stream
-                logger.info("[PREFETCH-CPU-WORKER] native ready polling + original CPU planner/DMA; capacity=%d",
-                            self._cpu_prefetch_dispatcher.capacity)
-            else:
-                logger.info("[PREFETCH-CPU-WORKER] unsupported case; keeping ACL host dispatch")
         if self._host_hybrid_enabled:
             from vllm_ascend.expert_offload.host_transfer import attach_host_transfers
             attach_host_transfers(self)
@@ -1040,7 +983,7 @@ class ExpertOffloadManager:
         Touch it only via untyped_storage() slicing, never through the tensor
         view. No-op for non-quantized (other dtype) models.
         """
-        if (self.offload_config.cpu_moe.weight_format == "nz_mxfp4"
+        if (self._host_hybrid_enabled
                 and getattr(self, "_cpu_weights_finalized", False)):
             raise RuntimeError("Retire the NZ CPU backend before replacing shared weight storage")
         prepared = getattr(self, "_prepared_expert_h2d", {})
@@ -1158,7 +1101,7 @@ class ExpertOffloadManager:
         num_moe_layers = len(self.w13_weights_cpu)
         num_experts = len(self.w13_weights_cpu[0])
         use_shard = self.offload_config.shard_per_rank
-        verify_nz = mxfp4 and self.offload_config.cpu_moe.weight_format == "nz_mxfp4"
+        verify_nz = mxfp4 and self._host_hybrid_enabled
         if verify_nz:
             self._nz_cpu_layout_verified = set()
         for layer_id in range(num_moe_layers):
@@ -3505,7 +3448,13 @@ class ExpertOffloadManager:
 
             cpu = getattr(getattr(self, "offload_config", None), "cpu_moe", None)
             node = getattr(cpu, "host_weight_numa_node", None)
-            allocator = self._expert_host_allocator = HostWeightAllocator(node)
+            affinity = getattr(cpu, "startup_affinity", None) if getattr(cpu, "enabled", False) else None
+            if node is None and affinity is not None:
+                allocator = HostWeightAllocator(affinity.host_weight_numa_node, allow_policy_fallback=True)
+                node = affinity.host_weight_numa_node
+            else:
+                allocator = HostWeightAllocator(node)
+            self._expert_host_allocator = allocator
             if node is not None:
                 logger.info("[EXPERT-HOST-ALLOC] DMA weights NUMA=%d allocation_cpu=%d; CPU expert NUMA configuration unchanged",
                             node, allocator.cpu)
@@ -3523,12 +3472,8 @@ class ExpertOffloadManager:
             # weight-DMA streams that may still reference them drain.  The
             # handshake stream may wait for this callback's done event, so
             # synchronizing it here would wait for this callback itself.
-            seen = {id(selected)}
-            for name in ("load_stream", "_cpu_prefetch_dma_stream"):
-                other = getattr(self, name, None)
-                if other is not None and id(other) not in seen:
-                    transport.synchronize(other)
-                    seen.add(id(other))
+            if selected is not self.load_stream:
+                transport.synchronize(self.load_stream)
             retired_ids = {id(entry) for entry in snapshot}
             retired[:] = [entry for entry in retired if id(entry) not in retired_ids]
 
@@ -3542,27 +3487,10 @@ class ExpertOffloadManager:
         if weight_worker is not None:
             weight_worker.close()
             self._host_weight_worker = None
-        worker = getattr(self, "_cpu_prefetch_dispatcher", None)
-        if worker is not None:
-            # close first drains registered prefetch streams while its worker
-            # remains alive, then stops/joins and retires DMA/signal streams.
-            worker.close()
-            self._cpu_prefetch_dispatcher = None
-            self._cpu_prefetch_dma_stream = None
-        candidates = getattr(self, "_device_prefetch_candidates", {})
-        if candidates:
-            self._prefetch_stream.synchronize()
-            for candidate in candidates.values():
-                candidate.transport.copier.close()
-            candidates.clear()
-            self._device_prefetch_graph_refs.clear()
         transport = getattr(self, "h2d_transport", None)
         if transport is not None:
             transport.synchronize(self.load_stream)
             transport.close()
-        trace = getattr(self, "_prefetch_trace", None)
-        if trace is not None:
-            trace.close()
         # Cached views retain backing tensors until all worker DMA is retired.
         getattr(self, "_expert_h2d_views", {}).clear()
         getattr(self, "_retired_expert_h2d_views", []).clear()
@@ -3700,7 +3628,6 @@ class ExpertOffloadManager:
             from .dma_submit_timing import stamp
             timing['submission_mode'] = 'per_expert_pipeline'
             timing['expert_submissions'] = []
-        trace = self._prefetch_trace
         loads = list(loads)
         transport = self._get_h2d_transport()
         for index, (slot, eid) in enumerate(loads):
@@ -3710,15 +3637,12 @@ class ExpertOffloadManager:
                 stamp(expert_timing, 'descriptor_begin')
                 if index == 0:
                     stamp(timing, 'descriptor_begin')
-            trace.mark(CpuPrefetchPhase.DESCRIPTOR_BEGIN)
             tasks = self._build_expert_h2d_tasks(layer, layer_idx, eid, slot)
             if timing is not None:
                 stamp(expert_timing, 'descriptor_end')
                 if index == 0:
                     # The first-copy delay now includes only the first expert.
                     stamp(timing, 'descriptor_end')
-            trace.mark(CpuPrefetchPhase.DESCRIPTOR_END, len(tasks), 1)
-            trace.mark(CpuPrefetchPhase.COPY_BATCH_BEGIN, len(tasks), 1)
             if timing is not None and hasattr(transport, 'copy_batch_timed'):
                 transport.copy_batch_timed(tasks, expert_timing)
                 if index == 0:
@@ -3732,17 +3656,14 @@ class ExpertOffloadManager:
             if timing is not None:
                 stamp(expert_timing, 'batch_copy_return')
                 timing['expert_submissions'].append(expert_timing)
-            trace.mark(CpuPrefetchPhase.COPY_BATCH_END)
         if timing is not None:
             stamp(timing, 'batch_copy_return')
         # Keep derived NPU work behind all H2D submissions. The caller then
         # copies the mapping and publishes ready on this same DMA stream.
-        trace.mark(CpuPrefetchPhase.SCALE_REFRESH_BEGIN)
         plan = getattr(self, "_prepared_expert_h2d", {}).get(layer_idx)
         if plan is None or not plan.provides_fp32_scale:
             for slot, _ in loads:
                 self._refresh_expert_fp32_scale(layer, slot)
-        trace.mark(CpuPrefetchPhase.SCALE_REFRESH_END)
         if timing is not None:
             stamp(timing, 'scale_refresh_return')
 
@@ -3994,14 +3915,7 @@ class ExpertOffloadManager:
             if stats is not None:
                 gt_ids = set(topk_ids_gt_h.reshape(-1).tolist())
                 subst_count = float((topk_ids_gt_h != topk_ids_h).sum())
-        trace = self._prefetch_trace
-        trace.mark(CpuPrefetchPhase.LOAD_STREAM_ENTER_BEGIN)
-        chosen_load_stream = self.load_stream
-        if is_prefetch and self._cpu_prefetch_dispatcher is not None:
-            chosen_load_stream = self._cpu_prefetch_dma_stream
-        with torch_npu.npu.stream(chosen_load_stream):
-            trace.mark(CpuPrefetchPhase.LOAD_STREAM_ENTER_END)
-            trace.mark(CpuPrefetchPhase.IDS_TO_LIST_BEGIN)
+        with torch_npu.npu.stream(self.load_stream):
             id_rows = None
             # Hotness observation only on the reactive (non-prefetch) H2D path
             # with LRC policy enabled.
@@ -4017,7 +3931,6 @@ class ExpertOffloadManager:
                     id_rows,
                     router_scores=router_scores,
                 )
-                self._refresh_device_prefetch_priority(layer_idx)
             else:
                 if is_prefetch:
                     id_rows = topk_ids_h.tolist()
@@ -4025,13 +3938,9 @@ class ExpertOffloadManager:
                 else:
                     needed = set(_valid_eids(topk_ids_h))
 
-            trace.mark(CpuPrefetchPhase.IDS_TO_LIST_END)
-            trace.mark(CpuPrefetchPhase.MAP_TO_LIST_BEGIN)
             l2p_list = log2phy_np.tolist()
             slot_owner = {s: e for e, s in enumerate(l2p_list) if s >= 0}
             on_device = set(slot_owner.values())
-            trace.mark(CpuPrefetchPhase.MAP_TO_LIST_END)
-            trace.mark(CpuPrefetchPhase.SCORE_BEGIN)
 
             if is_prefetch:
                 # Prefetch: load at most prefetch_topk experts for the layer — a
@@ -4062,7 +3971,6 @@ class ExpertOffloadManager:
             else:
                 need_to_load = needed - on_device
 
-            trace.mark(CpuPrefetchPhase.SCORE_END, len(need_to_load), len(needed))
             already_there = needed & on_device  # for cache_stats / debug
 
             # both hit-rate numerators must be taken HERE — the load loop
@@ -4114,7 +4022,6 @@ class ExpertOffloadManager:
             # (merge): rank all resident candidates once with
             # choose_victims(count=len(need_to_load)) instead of calling
             # choose_victim() per miss.
-            trace.mark(CpuPrefetchPhase.VICTIM_BEGIN)
             n_copies = 0
             planned_loads = []
             victims = None
@@ -4127,7 +4034,6 @@ class ExpertOffloadManager:
                         count=len(need_to_load),
                     )
                 )
-            trace.mark(CpuPrefetchPhase.VICTIM_END)
             for eid in need_to_load:
                 if self.cache_policy is not None:
                     victim = next(victims, None)
@@ -4169,9 +4075,7 @@ class ExpertOffloadManager:
 
             # (merge): submit the batch first so the CPU-only stats
             # bookkeeping below overlaps the transfer, then synchronize
-            trace.mark(CpuPrefetchPhase.PLAN_END, len(planned_loads))
             self._load_expert_weights_into_slots(layer, layer_idx, planned_loads)
-            trace.mark(CpuPrefetchPhase.BOOKKEEPING_BEGIN)
 
             # what was ACTUALLY transferred this pass — identical to the
             # per-expert loop's `loaded_ids`, derived from planned_loads.
@@ -4238,36 +4142,13 @@ class ExpertOffloadManager:
             # (merge): _synchronize_h2d() replaces load_stream.synchronize(). On the torch backend they are the same
             # call; on MemFabric it also retires the in-flight sparse-copy
             # descriptors. Still load-bearing under replay.
-            trace.mark(CpuPrefetchPhase.BOOKKEEPING_END)
-            trace.mark(CpuPrefetchPhase.H2D_SYNC_BEGIN)
-            # The capture-time dispatcher already gates the prefetch stream
-            # on its completion event.  Keep the DMA asynchronous here and
-            # hand the event to the worker so it can record channel.done only
-            # after the weight copies finish.  A retired-view list means a
-            # cold reconfiguration is releasing old allocations; retain the
-            # host sync in that exceptional case.
-            async_prefetch = bool(
-                getattr(getattr(self, "_prefetch_callback_context", None),
-                        "allow_async", False)
-            )
-            from vllm_ascend.expert_offload.h2d_transfer import TorchCopyH2DTransport
-            event_safe_transport = isinstance(
-                self._get_h2d_transport(), TorchCopyH2DTransport)
-            if (is_prefetch and async_prefetch and event_safe_transport
-                    and not getattr(self, "_retired_expert_h2d_views", None)):
-                dma_done = torch_npu.npu.Event()
-                chosen_load_stream.record_event(dma_done)
-                trace.mark(CpuPrefetchPhase.H2D_SYNC_END)
-                return dma_done
-            self._synchronize_h2d(stream=chosen_load_stream)
-            trace.mark(CpuPrefetchPhase.H2D_SYNC_END)
+            self._synchronize_h2d(stream=self.load_stream)
             if is_prefetch and getattr(self, "_host_hybrid_enabled", False):
                 self._host_prefetch_calls += 1
                 self._host_prefetch_loads += len(planned_loads)
                 if self._host_prefetch_calls == 1 or self._host_prefetch_calls % 1024 == 0:
                     logger.info("[HYBRID-HOST] prefetch completed calls=%d loads=%d",
                                 self._host_prefetch_calls, self._host_prefetch_loads)
-        trace.mark(CpuPrefetchPhase.LOAD_STREAM_EXIT)
 
     def _preload_hot_experts(self):
         """Preload each layer's top-N hot experts into device resident slots
@@ -4442,16 +4323,6 @@ class ExpertOffloadManager:
         topk_weights, topk_ids = probs.topk(self.topk, dim=-1)
         return topk_weights, topk_ids
 
-    def _cpu_device_prefetch_required(self) -> bool:
-        cpu = getattr(self.offload_config, "cpu_moe", None)
-        return bool(
-            getattr(cpu, "enabled", False)
-            and getattr(cpu, "transfer_scheduler", "cpu") == "npu"
-            and getattr(cpu, "transfer_policy", "") == "load_balance"
-            and getattr(cpu, "weight_format", "") == "gguf"
-            and self.ep_size == 1
-        )
-
     def trigger_next_layer_prefetch(self, layer, hidden_states: torch.Tensor | None = None) -> None:
         """Trigger next-layer expert prefetch after the GMM kernel submits.
 
@@ -4489,18 +4360,6 @@ class ExpertOffloadManager:
         predicted = self.predict_next_layer_experts_npu(layer_idx, hidden_states)
         if predicted is None:
             return
-        if self._dispatch_device_prefetch(layer_idx + 1, predicted):
-            return
-        if self._cpu_device_prefetch_required():
-            # In the CPU-enabled NPU-scheduler configuration, do not silently
-            # fall back to the Python planner. The real top-k path still
-            # performs normal reactive loading if a prediction is unavailable.
-            logger.warning_once(
-                "[PREFETCH-DEVICE] candidate unavailable; keeping this step "
-                "reactive instead of entering the host planner"
-            )
-            return
-
         staged = self._stage_predicted_topk(layer_idx, hidden_states, predicted=predicted)
         if staged is None:
             return
@@ -4509,137 +4368,19 @@ class ExpertOffloadManager:
         torch_npu.npu.current_stream().record_event(ready_to_load_event)
         self._dispatch_prefetch(staged, ready_to_load_event)
 
-    def _init_device_prefetch(self) -> None:
-        """Build optional device-only plans after weights and hot preload settle."""
-        if not self.offload_config.expert_prefetch_enabled:
-            return
-        # The device-owned prefetch table is only part of the CPU-MoE path.
-        # With CPU MoE disabled the original pure-NPU route remains untouched.
-        if not getattr(getattr(self.offload_config, "cpu_moe", None), "enabled", False):
-            return
-        from vllm_ascend.expert_offload.device_prefetch import DevicePrefetchCandidate
-
-        for target_idx, layer in enumerate(self.moe_layers[1:], start=1):
-            candidate = DevicePrefetchCandidate.try_create(self, layer)
-            if candidate is not None:
-                self._device_prefetch_candidates[target_idx] = candidate
-        if self._device_prefetch_candidates:
-            # This is initialization only, never a replay-time/event callback
-            # edge. Complete pointer-table uploads before any graph is captured.
-            ready = torch_npu.npu.Event()
-            torch_npu.npu.current_stream().record_event(ready)
-            ready.synchronize()
-            self._device_prefetch_init_ready = ready
-            logger.info("[PREFETCH-DEVICE] armed %d target layers; NPU LRC selection feeds native poll/Event copy_ worker",
-                        len(self._device_prefetch_candidates))
-
-    def observe_device_prefetch_route(self, layer_idx, topk_ids, topk_weights=None) -> None:
-        """Feed real route observations into the device-owned LRC table."""
-        candidate = getattr(self, "_device_prefetch_candidates", {}).get(layer_idx)
-        if candidate is not None:
-            candidate.observe_actual(topk_ids, topk_weights)
-
-    def _refresh_device_prefetch_priority(self, layer_idx) -> None:
-        candidate = getattr(self, "_device_prefetch_candidates", {}).get(layer_idx)
-        if candidate is None:
-            return
-        # Device-owned candidates update LRC from the NPU route tensor. Keep
-        # this host callback as a compatibility no-op for old host paths.
-        if hasattr(candidate, "observe_actual"):
-            return
-        # update_weights already joined this target's prefetch before staging
-        # routing/map D2H and invoking this callback. Its old priority readers
-        # are retired. Queue the stable-address refresh on the current load
-        # stream; _update_weights' existing tail synchronize gates the compute
-        # stream and therefore every subsequent prefetch-ready record.
-        # ACL callback threads have neither forward context nor InferenceMode.
-        with torch.inference_mode():
-            candidate.refresh_priority_from_host()
-
-    def _dispatch_device_prefetch(self, next_idx, predicted) -> bool:
-        candidate = getattr(self, "_device_prefetch_candidates", {}).get(next_idx)
-        if candidate is None:
-            return False
-        weights, ids = predicted
-        compute_stream = torch_npu.npu.current_stream()
-        capturing = bool(_EXTRA_CTX.capturing)
-        ready = torch_npu.npu.Event()
-        compute_stream.record_event(ready)
-        # Prediction outputs were allocated on compute_stream but are consumed
-        # asynchronously on the side stream. Protect their allocator lifetime.
-        ids.record_stream(self._prefetch_stream)
-        if weights is not None:
-            weights.record_stream(self._prefetch_stream)
-        with torch_npu.npu.stream(self._prefetch_stream):
-            self._prefetch_stream.wait_event(ready)
-            candidate.enqueue(ids, weights)
-            candidate.submit_event_copy(
-                self._prefetch_stream,
-                capturing=capturing,
-                static_id=self._prefetch_trace.next_static_id(),
-            )
-            done = torch_npu.npu.Event()
-            self._prefetch_stream.record_event(done)
-        with self._prefetch_state_lock:
-            self._prefetch_layer_npu_event[next_idx] = done
-        if capturing:
-            # Replay reuses captured addresses; Python does not run on replay.
-            self._device_prefetch_graph_refs.append((ids, weights, ready, done))
-        return True
-
-    def _run_prefetch_callback(self, prefetch_fn, args, mapping_h, trace_layer=-1,
-                               static_id=0, allow_async=False) -> None:
-        """Run on the report thread without reading forward-context state.
-
-        InferenceMode is thread-local and is not inherited by ACL callbacks.
-        The installed torch-npu callback bridge does not release the GIL when
-        a Python exception escapes. A failed upload can also have partially
-        overwritten a resident slot, so terminate rather than reuse its map.
-        """
-        trace = None
-        previous = None
-        trace_started = False
-        result = None
-        context = getattr(self, "_prefetch_callback_context", None)
-        if context is None:
-            context = self._prefetch_callback_context = threading.local()
-        previous_async = getattr(context, "allow_async", False)
-        context.allow_async = bool(allow_async)
-        def trace_mark(name):
-            try:
-                if trace is not None:
-                    trace.mark(getattr(CpuPrefetchPhase, name))
-            except BaseException:
-                pass
+    def _run_prefetch_callback(self, prefetch_fn, args) -> None:
+        """Run the planner in inference mode on the ACL report thread."""
         try:
-            try:
-                trace = getattr(self, "_prefetch_trace", None)
-                if trace is not None:
-                    previous = trace.begin_callback(trace_layer, static_id)
-                    trace_started = True
-            except BaseException:
-                trace = None
-            trace_mark("INFERENCE_ENTER")
             with torch.inference_mode():
-                trace_mark("PLANNER_ENTER")
-                result = prefetch_fn(args)
-                trace_mark("PLANNER_RETURN")
-            trace_mark("INFERENCE_EXIT")
+                prefetch_fn(args)
         except BaseException:
-            trace_mark("CALLBACK_ERROR")
+            # An exception cannot escape the callback bridge or release the
+            # graph with a partially written expert slot.
             try:
                 self._note_cb_failure("prefetch")
             except BaseException:
                 pass
             os._exit(1)
-        finally:
-            context.allow_async = previous_async
-            if trace_started:
-                try:
-                    trace.end_callback(previous)
-                except BaseException:
-                    pass
-        return result
 
     def _dispatch_prefetch(self, staged, ready_event) -> None:
         """Fork the prefetch stream, plan+H2D, publish log2phy, record the join.
@@ -4653,61 +4394,41 @@ class ExpertOffloadManager:
 
         `staged` is exactly _stage_predicted_topk's return tuple.
         """
-        if self._host_hybrid_enabled and self.offload_config.cpu_moe.native_dispatch:
+        if self._host_hybrid_enabled:
             from .native_prefetch import dispatch_native_prefetch
             dispatch_native_prefetch(self, staged)
             return
         (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h) = staged
-        static_id = self._prefetch_trace.next_static_id()
         capturing = bool(_EXTRA_CTX.capturing)
-        self._prefetch_trace.mark_static(CpuPrefetchPhase.STATIC_DISPATCH_BEGIN,
-                                         next_idx, static_id, capturing)
         with torch_npu.npu.stream(self._prefetch_stream):
             if ready_event is not None:
                 self._prefetch_stream.wait_event(ready_event)
             current_compute_stream = torch_npu.npu.current_stream()
             subscribed_compute_streams = get_subscribed_compute_streams()
-            if (not capturing or self._cpu_prefetch_dispatcher is None) and current_compute_stream not in subscribed_compute_streams:
+            if current_compute_stream not in subscribed_compute_streams:
                 torch_npu.npu._subscribe_report(current_compute_stream)
                 subscribed_compute_streams.add(current_compute_stream)
 
             prefetch_fn, prefetch_args = self._build_prefetch_call(
                 topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h
             )
-            nxt = next_idx
 
-            def _prefetch_host_cb(_args, allow_async=False):
-                return self._run_prefetch_callback(prefetch_fn, _args, log2phy_h,
-                                                   trace_layer=nxt, static_id=static_id,
-                                                   allow_async=allow_async)
+            def _prefetch_host_cb(_args):
+                self._run_prefetch_callback(prefetch_fn, _args)
 
-            self._prefetch_trace.mark_static(CpuPrefetchPhase.STATIC_CALLBACK_ENQUEUE,
-                                             nxt, static_id, capturing)
             if capturing:
-                if self._cpu_prefetch_dispatcher is not None:
-                    self._cpu_prefetch_dispatcher.record_submission(
-                        stream=current_compute_stream,
-                        callback=lambda: _prefetch_host_cb(prefetch_args, True),
-                        layer=nxt,
-                        static_id=static_id,
-                    )
-                else:
-                    if self.enable_multi_card:
-                        self._log_mc_debug_schedule(next_idx, is_prefetch=True)
-                    torch_npu.npu._launch_host_func(current_compute_stream, _prefetch_host_cb, prefetch_args)
+                if self.enable_multi_card:
+                    self._log_mc_debug_schedule(next_idx, is_prefetch=True)
+                torch_npu.npu._launch_host_func(current_compute_stream, _prefetch_host_cb, prefetch_args)
             else:
-                _prefetch_host_cb(prefetch_args, False)
+                _prefetch_host_cb(prefetch_args)
 
-            self._prefetch_trace.mark_static(CpuPrefetchPhase.STATIC_MAP_PUBLISH_ENQUEUE,
-                                             nxt, static_id, capturing)
             next_layer.log2phy.copy_(log2phy_h, non_blocking=capturing)
             # 记录一个传输流完成的事件，用于后续主流和它汇聚
             load_done_event = torch_npu.npu.Event()
             self._prefetch_stream.record_event(load_done_event)
-            self._prefetch_trace.mark_static(CpuPrefetchPhase.STATIC_DONE_RECORD_ENQUEUE,
-                                             nxt, static_id, capturing)
             with self._prefetch_state_lock:
-                self._prefetch_layer_npu_event[nxt] = load_done_event
+                self._prefetch_layer_npu_event[next_idx] = load_done_event
 
     def _stage_predicted_topk(self, layer_idx, hidden_states, predicted=None):
         """Resolve the next layer, predict its experts on-device, and D2H-stage
@@ -4723,13 +4444,9 @@ class ExpertOffloadManager:
             predicted = self.predict_next_layer_experts_npu(layer_idx, hidden_states)
         if predicted is None:
             return None
-        if self._host_hybrid_enabled and self.offload_config.cpu_moe.native_dispatch:
+        if self._host_hybrid_enabled:
             from .native_prefetch import stage_native_prefetch
             return stage_native_prefetch(self, next_idx, predicted, bool(_EXTRA_CTX.capturing))
-        stage_static_id = self._prefetch_trace.next_static_id()
-        stage_capturing = bool(_EXTRA_CTX.capturing)
-        self._prefetch_trace.mark_static(CpuPrefetchPhase.STATIC_STAGING_BEGIN,
-                                         next_idx, stage_static_id, stage_capturing)
         topk_weights, topk_ids = predicted
         next_layer = self.moe_layers[next_idx]
         num_tokens = topk_ids.size(0)
@@ -4769,8 +4486,6 @@ class ExpertOffloadManager:
                 # would break graph capture. Same path topk_ids_h already uses.
                 mc2_mask_h.copy_(mc2_mask[:num_tokens].to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
 
-        self._prefetch_trace.mark_static(CpuPrefetchPhase.STATIC_STAGING_END,
-                                         next_idx, stage_static_id, stage_capturing)
         return (topk_ids_h, topk_weights_h, log2phy_h, self._prefetch_log2phy_np, next_layer, next_idx, mc2_mask_h)
 
     def _build_prefetch_call(

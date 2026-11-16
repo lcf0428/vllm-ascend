@@ -368,10 +368,11 @@ PYBIND11_MODULE(_vllm_ascend_lrc, m) {
       .def_readonly("mapping", &NativePlan::mapping).def_readonly("loads", &NativePlan::loads)
       .def_readonly("cpu_ids", &NativePlan::ids).def_readonly("cpu_weights", &NativePlan::weights);
   py::class_<NativeHostPlanner, std::shared_ptr<NativeHostPlanner>>(m, "NativeHostPlanner")
-      .def(py::init<Id, Id, Id, Id, Id, Id, std::string, Policy*, std::vector<double>, Id>(),
+      .def(py::init<Id, Id, Id, Id, Id, Id, Policy*, std::vector<double>, Id, Id>(),
            py::arg("experts"), py::arg("slots"), py::arg("layer"), py::arg("numerator"),
-           py::arg("denominator"), py::arg("max_transfers"), py::arg("policy"),
-           py::arg("lrc"), py::arg("scores"), py::arg("npu_fixed_cost") = 0, py::keep_alive<1, 9>())
+           py::arg("denominator"), py::arg("max_transfers"),
+           py::arg("lrc"), py::arg("scores"), py::arg("npu_fixed_cost") = 0,
+           py::arg("cpu_extra_cost") = -1, py::keep_alive<1, 8>())
       .def("plan", &NativeHostPlanner::plan)
       .def("plan_prefetch", &NativeHostPlanner::plan_prefetch)
       .def("prepare_prefetch", &NativeHostPlanner::prepare_prefetch)

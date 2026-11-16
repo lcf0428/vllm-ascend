@@ -168,6 +168,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
+from vllm_ascend.expert_offload.graph_capacity import validate_graph_token_capacity
 from vllm_ascend.expert_offload.benchmark_counters import get_route_counters
 from vllm_ascend.expert_offload.expert_offload_manager import (
     get_expert_offload_manager,
@@ -6649,6 +6650,15 @@ class NPUModelRunner(GPUModelRunner):
             for _, descs in capture_descs
             for desc in descs
         })
+        cpu_moe = get_ascend_config().expert_offload_config.cpu_moe
+        if cpu_moe.enabled:
+            validate_graph_token_capacity(
+                cpu_moe.max_num_tokens,
+                capture_sizes,
+                stage="resolved",
+                query_len=self.uniform_decode_query_len,
+                max_num_seqs=self.max_num_reqs,
+            )
 
         # NOTE: Since aclgraph_batch_sizes cannot be determined until here,
         # we set the graph params right before initializing the keys.

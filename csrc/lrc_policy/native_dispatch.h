@@ -30,23 +30,22 @@ struct NativePlan {
 // Same admission arithmetic, ordering and LRC state as HostTransferPolicy.
 // One instance is shared by eager calls and every captured shape of a layer.
 class NativeHostPlanner {
-  Id experts_, slots_, layer_, numerator_, denominator_, max_transfers_, npu_fixed_cost_;
-  std::string policy_;
+  Id experts_, slots_, layer_, numerator_, denominator_, max_transfers_, npu_fixed_cost_, cpu_extra_cost_;
   Policy* lrc_;
   std::vector<double> scores_;
   std::mutex mutex_;
  public:
   NativeHostPlanner(Id experts, Id slots, Id layer, Id numerator, Id denominator,
-                    Id max_transfers, std::string policy, Policy* lrc,
-                    std::vector<double> scores, Id npu_fixed_cost = 0)
+                    Id max_transfers, Policy* lrc,
+                    std::vector<double> scores, Id npu_fixed_cost = 0, Id cpu_extra_cost = -1)
       : experts_(experts), slots_(slots), layer_(layer), numerator_(numerator),
-        denominator_(denominator), max_transfers_(max_transfers), npu_fixed_cost_(npu_fixed_cost), policy_(policy),
+        denominator_(denominator), max_transfers_(max_transfers), npu_fixed_cost_(npu_fixed_cost),
+        cpu_extra_cost_(cpu_extra_cost == -1 ? numerator : cpu_extra_cost),
         lrc_(lrc), scores_(std::move(scores)) {
     if (experts < 1 || slots < 0 || slots > experts || denominator < 1 || numerator < 0 ||
-        numerator > denominator || max_transfers < 0 || npu_fixed_cost < 0 || scores_.size() != size_t(experts))
+        numerator > denominator || max_transfers < 0 || npu_fixed_cost < 0 || cpu_extra_cost_ < 0 ||
+        scores_.size() != size_t(experts))
       throw std::invalid_argument("Invalid native planner configuration");
-    if (policy != "first_miss" && policy != "frequency" && policy != "load_balance")
-      throw std::invalid_argument("Unsupported native admission policy");
   }
 
   Id experts() const { return experts_; }
@@ -95,36 +94,28 @@ class NativeHostPlanner {
     }
     for (Id e : cold) targets.push_back(mapping[e]);
     for (Id e : order) if (mapping[e] < 0) missing.push_back(e);
-    Id n = 1;
-    if (policy_ == "load_balance") {
-      std::stable_sort(missing.begin(), missing.end(), [&](Id a, Id b) {
-        if (counts[a] != counts[b]) return counts[a] > counts[b];
-        return scores_[a] == scores_[b] ? a < b : scores_[a] > scores_[b];
-      });
-      // A repeated expert still consumes one CPU computation per token,
-      // while uploading that expert's weights is paid only once.
-      Id remaining_routes = 0;
-      for (Id e : missing) remaining_routes += counts[e];
-      const Id copy_unit = denominator_ - numerator_;
-      __int128 best_cost = std::max(static_cast<__int128>(remaining_routes) * numerator_,
-                                    static_cast<__int128>(npu_fixed_cost_));
-      n = 0;
-      const Id limit = std::min<Id>({Id(missing.size()), Id(targets.size()), max_transfers_});
-      for (Id copied = 1; copied <= limit; ++copied) {
-        remaining_routes -= counts[missing[copied - 1]];
-        __int128 cpu_cost = static_cast<__int128>(remaining_routes) * numerator_;
-        __int128 copy_cost = static_cast<__int128>(copied) * copy_unit + npu_fixed_cost_;
-        __int128 cost = std::max(cpu_cost, copy_cost);
-        if (cost < best_cost) { best_cost = cost; n = copied; }
-      }
-    } else if (policy_ == "frequency") {
-      std::stable_sort(missing.begin(), missing.end(), [&](Id a, Id b) { return scores_[a] > scores_[b]; });
+    std::stable_sort(missing.begin(), missing.end(), [&](Id a, Id b) {
+      if (counts[a] != counts[b]) return counts[a] > counts[b];
+      return scores_[a] == scores_[b] ? a < b : scores_[a] > scores_[b];
+    });
+    const auto cpu_cost = [&](Id e) -> __int128 {
+      return numerator_ + static_cast<__int128>(counts[e] - 1) * cpu_extra_cost_;
+    };
+    __int128 remaining_cpu = 0;
+    for (Id e : missing) remaining_cpu += cpu_cost(e);
+    const Id copy_unit = denominator_ - numerator_;
+    __int128 best_cost = std::max(remaining_cpu, static_cast<__int128>(npu_fixed_cost_));
+    Id n = 0;
+    const Id limit = std::min<Id>({Id(missing.size()), Id(targets.size()), max_transfers_});
+    for (Id copied = 1; copied <= limit; ++copied) {
+      remaining_cpu -= cpu_cost(missing[copied - 1]);
+      __int128 copy_cost = static_cast<__int128>(copied) * copy_unit + npu_fixed_cost_;
+      __int128 cost = std::max(remaining_cpu, copy_cost);
+      if (cost < best_cost) { best_cost = cost; n = copied; }
     }
     NativePlan out{mapping, {}, std::move(ids), std::move(weights)};
     for (Id i = 0; i < std::min<Id>({n, Id(missing.size()), Id(targets.size())}); ++i) {
       Id e = missing[i], slot = targets[i], victim = owners[slot];
-      if (policy_ == "frequency" && (scores_[e] < 2.0 ||
-          scores_[e] <= (victim >= 0 ? scores_[victim] : 0.0) * 1.2)) continue;
       if (victim >= 0) out.mapping[victim] = -1;
       out.mapping[e] = slot; out.loads.emplace_back(slot, e);
     }

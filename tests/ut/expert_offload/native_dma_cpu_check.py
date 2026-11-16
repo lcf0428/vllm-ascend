@@ -20,7 +20,7 @@ def channel(e,prefetch=False,dependency=None):
  flag=np.zeros(1,np.uint32);ids=np.array([[e]],np.int64);weights=np.ones((1,1),np.float32)
  mapping=np.array([0,-1,-1,-1],np.int32);dmapping=mapping.copy();ready=np.zeros(1,np.uint64);done=np.zeros(1,np.uint64)
  state=Policy(1,4,32,.9,1.,.5,.3,.01,False)
- planner=NativeHostPlanner(4,1,0,0,1,1,'first_miss',state,[0.]*4)
+ planner=NativeHostPlanner(4,1,0,2,3,1,state,[0.]*4)
  task=fixture.task();taskaddr=fixture.address(task)
  if prefetch:
   args=(addr(flag),addr(ids),addr(weights),addr(mapping),addr(ready),1,1,0,8,4,1,planner)

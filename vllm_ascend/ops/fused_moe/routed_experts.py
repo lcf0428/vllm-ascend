@@ -55,7 +55,11 @@ def _prepare_expert_offload_before_super(layer_name, moe_config, quant_config, e
     if moe_config.ep_size != 1:
         return
     try:
-        from vllm_ascend.expert_offload import get_expert_offload_manager, has_expert_offload_manager
+        from vllm_ascend.expert_offload.expert_offload_manager import (
+            get_expert_offload_manager,
+            has_expert_offload_manager,
+        )
+
         if not has_expert_offload_manager():
             return
         manager = get_expert_offload_manager()
@@ -737,8 +741,19 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
 
     def _get_quant_method(self, prefix, quant_config, moe_config):
         if quant_config is None:
-            return super()._get_quant_method(prefix, quant_config, moe_config)
-        return quant_config.get_quant_method(self, prefix, tid2eid=self.tid2eid)
+            method = super()._get_quant_method(prefix, quant_config, moe_config)
+        else:
+            method = quant_config.get_quant_method(self, prefix, tid2eid=self.tid2eid)
+
+        if "mtp" not in prefix.split(".") and get_ascend_config().expert_offload_config.cpu_moe.enabled:
+            scheme = getattr(method, "quant_method", None)
+            quant_type = getattr(scheme, "quant_type", QuantType.NONE)
+            if quant_type not in (QuantType.W4A4MXFP, QuantType.W4A8MXFP, QuantType.W4A16MXFP):
+                quant_name = getattr(quant_type, "name", quant_type)
+                raise ValueError(
+                    f"CPU MoE requires MXFP4 routed expert weights, but layer {prefix!r} uses {quant_name}"
+                )
+        return method
 
     def get_eplb_parameter(self, name: str):
         """Return an expert parameter from the refactored weight owner."""

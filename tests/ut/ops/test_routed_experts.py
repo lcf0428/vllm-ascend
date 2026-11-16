@@ -6,7 +6,81 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_ascend.expert_offload import expert_offload_manager
+from vllm_ascend.ops.fused_moe import routed_experts as routed_experts_module
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts, EplbExpertTensorList
+from vllm_ascend.quantization.quant_type import QuantType
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_offload_capacity_is_applied_before_parent_init(monkeypatch, positional):
+    manager = SimpleNamespace(moe_layers=[object()])
+    monkeypatch.setattr(expert_offload_manager, "_EXPERT_OFFLOAD_MANAGER", manager)
+    offload_config = SimpleNamespace(
+        expert_offload=True,
+        num_device_experts_for_layer=[32, 84].__getitem__,
+    )
+    monkeypatch.setattr(
+        routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(expert_offload_config=offload_config)
+    )
+
+    class ParentInitReached(Exception):
+        pass
+
+    def parent_init(self, layer_name, params_dtype, moe_config, quant_config, expert_map_manager):
+        assert moe_config.num_local_experts == expert_map_manager._local_num_experts == 84
+        assert torch.equal(expert_map_manager._expert_map[:84], torch.arange(84, dtype=torch.int32))
+        assert torch.all(expert_map_manager._expert_map[84:] == -1)
+        raise ParentInitReached
+
+    monkeypatch.setattr(AscendRoutedExperts.__mro__[1], "__init__", parent_init)
+    args = {
+        "layer_name": "model.layers.3.mlp.experts",
+        "params_dtype": torch.bfloat16,
+        "moe_config": SimpleNamespace(ep_size=1, num_logical_experts=256, num_local_experts=256),
+        "quant_config": object(),
+        "expert_map_manager": SimpleNamespace(_local_num_experts=256, _expert_map=None),
+    }
+    with pytest.raises(ParentInitReached):
+        if positional:
+            AscendRoutedExperts(*args.values())
+        else:
+            AscendRoutedExperts(**args)
+
+
+@pytest.mark.parametrize(
+    ("enabled", "prefix", "quant_type", "reject"),
+    [
+        (True, "model.layers.3", QuantType.W4A4MXFP, False),
+        (True, "model.layers.3", QuantType.W4A8MXFP, False),
+        (True, "model.layers.3", QuantType.W4A16MXFP, False),
+        (True, "model.layers.3", QuantType.W8A8, True),
+        (True, "model.layers.3", QuantType.W8A8MXFP, True),
+        (True, "model.layers.3", QuantType.NONE, True),
+        (False, "model.layers.3", QuantType.W8A8, False),
+        (True, "model.mtp.0", QuantType.W8A8, False),
+    ],
+)
+def test_cpu_moe_validates_resolved_expert_quantization(monkeypatch, enabled, prefix, quant_type, reject):
+    offload_config = SimpleNamespace(cpu_moe=SimpleNamespace(enabled=enabled))
+    monkeypatch.setattr(
+        routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(expert_offload_config=offload_config)
+    )
+    routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
+    object.__setattr__(routed_experts, "tid2eid", None)
+    if quant_type is QuantType.NONE:
+        method = object()
+        quant_config = None
+        monkeypatch.setattr(AscendRoutedExperts.__mro__[1], "_get_quant_method", lambda *_: method)
+    else:
+        method = SimpleNamespace(quant_method=SimpleNamespace(quant_type=quant_type))
+        quant_config = SimpleNamespace(get_quant_method=lambda *args, **kwargs: method)
+
+    if reject:
+        with pytest.raises(ValueError, match=rf"CPU MoE requires MXFP4.*{prefix!r}.*{quant_type.name}"):
+            routed_experts._get_quant_method(prefix, quant_config, None)
+    else:
+        assert routed_experts._get_quant_method(prefix, quant_config, None) is method
 
 
 def _routed_experts(weight_views):

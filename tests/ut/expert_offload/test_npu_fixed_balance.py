@@ -6,11 +6,11 @@ native=pytest.importorskip('_vllm_ascend_lrc')
 
 
 def plan_pair(ids, fixed, cpu=100., copy=250.):
-    cfg=SimpleNamespace(transfer_policy='load_balance',balance_cpu_expert_us=cpu,
+    cfg=SimpleNamespace(balance_cpu_expert_us=cpu,
                         balance_copy_us=copy,balance_npu_fixed_us=fixed,balance_max_transfers=32)
     p=HostTransferPolicy(experts=8,slots=2,config=cfg)
     q=native.NativeHostPlanner(8,2,0,p.cpu_unit,p.cpu_unit+p.copy_unit,32,
-                              'load_balance',None,[0.]*8,p.npu_fixed_unit)
+                              None,[0.]*8,p.npu_fixed_unit)
     weights=[[1.]*len(row) for row in ids];mapping=[-1]*8
     a=p.plan(ids,weights,mapping);b=q.plan(ids,weights,mapping)
     assert list(a.loads)==b.loads

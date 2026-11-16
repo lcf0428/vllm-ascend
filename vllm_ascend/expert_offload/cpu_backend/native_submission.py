@@ -17,7 +17,7 @@ _LOG = logging.getLogger(__name__)
 
 
 class NativePollWorker:
-    def __init__(self, device):
+    def __init__(self, device, poll_cpu=None, completion_cpu=None):
         from kt_kernel import kt_kernel_ext
         from _vllm_ascend_lrc import NativeCpuDispatcher
 
@@ -27,8 +27,8 @@ class NativePollWorker:
         self.weight_stream = torch_npu.npu.SyncLaunchStream(device=device)
         self.engine = NativeCpuDispatcher(
             kt_kernel_ext.native_dispatch_api(), int(self.stream.npu_stream), int(self.weight_stream.npu_stream),
-            int(os.environ.get("KT_MOE_POLL_CPU", "6")),
-            int(os.environ.get("KT_MOE_COMPLETION_CPU", "7")))
+            poll_cpu if poll_cpu is not None else int(os.environ.get("KT_MOE_POLL_CPU", "6")),
+            completion_cpu if completion_cpu is not None else int(os.environ.get("KT_MOE_COMPLETION_CPU", "7")))
         self._dma_layers = {}
         self._dma_stream = None
         self._dma_capture_directory = None
@@ -90,14 +90,13 @@ class NativePollWorker:
             weights[slot].data_ptr(), inputs[slot].data_ptr(), result.data_ptr(), False)
         # Owners remain alive until graphs have retired and native threads joined.
         dma_layer = self._register_dma_layer(context.transfer)
-        if backend.config.weight_format == "nz_mxfp4":
-            manager = context.transfer.worker.manager
-            plan = self._dma_layers[(id(manager), context.transfer.layer_idx)][1]
-            sources, _, _, _, _ = plan.native_dma_table()
-            fields = {field[3]: source for field, source in zip(plan.fields, sources)}
-            expected = [fields[name] for name in ("w13", "w2", "w13_weight_scale", "w2_weight_scale")]
-            if wrapper.moe.weight_pointers() != expected:
-                raise RuntimeError("NZ CPU and native DMA must read the exact same source bytes")
+        manager = context.transfer.worker.manager
+        plan = self._dma_layers[(id(manager), context.transfer.layer_idx)][1]
+        sources, _, _, _, _ = plan.native_dma_table()
+        fields = {field[3]: source for field, source in zip(plan.fields, sources)}
+        expected = [fields[name] for name in ("w13", "w2", "w13_weight_scale", "w2_weight_scale")]
+        if wrapper.moe.weight_pointers() != expected:
+            raise RuntimeError("NZ CPU and native DMA must read the exact same source bytes")
         index = len(self.channels)
         self.channels.append((backend, hidden, ready, hostflag, context, task))
         native = self.engine.add(

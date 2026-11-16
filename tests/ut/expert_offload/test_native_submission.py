@@ -12,11 +12,10 @@ from vllm_ascend.expert_offload.lrc_policy import CppLRCExpertCachePolicy
 native = pytest.importorskip("_vllm_ascend_lrc")
 
 
-@pytest.mark.parametrize("policy", ["first_miss", "frequency", "load_balance"])
 @pytest.mark.parametrize("cache", [False, True])
-def test_repeated_native_plans_match_reference(policy, cache):
+def test_repeated_native_plans_match_reference(cache):
     rng = random.Random(817)
-    config = SimpleNamespace(transfer_policy=policy, balance_cpu_expert_us=70.0,
+    config = SimpleNamespace(balance_cpu_expert_us=70.0,
                              balance_copy_us=450.0, balance_max_transfers=32)
     states = [CppLRCExpertCachePolicy(num_layers=1, num_experts=32, cache_size=8, topk=6)
               if cache else None for _ in range(2)]
@@ -26,7 +25,7 @@ def test_repeated_native_plans_match_reference(policy, cache):
     reference = HostTransferPolicy(experts=32, slots=8, config=config, lrc=states[0])
     ratio = Fraction(70, 520)
     planner = native.NativeHostPlanner(32, 8, 0, ratio.numerator, ratio.denominator, 32,
-                                      policy, states[1]._native if cache else None, [0.0] * 32)
+                                      states[1]._native if cache else None, [0.0] * 32)
     mapping = list(range(8)) + [-1] * 24
     for _ in range(200):
         rows = rng.randint(1, 4)
@@ -46,7 +45,7 @@ def test_repeated_native_plans_match_reference(policy, cache):
 @pytest.mark.parametrize("id_type", [np.int32, np.int64])
 @pytest.mark.parametrize("map_type", [np.int32, np.int64])
 def test_native_prepare_mutates_only_owned_pinned_views(id_type, map_type):
-    planner = native.NativeHostPlanner(8, 2, 0, 1, 2, 2, "load_balance", None, [0.0] * 8)
+    planner = native.NativeHostPlanner(8, 2, 0, 1, 2, 2, None, [0.0] * 8)
     ids = np.asarray([[0, 2, 3, 4]], dtype=id_type)
     weights = np.asarray([[0.1, 0.2, 0.3, 0.4]], dtype=np.float32)
     mapping = np.asarray([0, 1] + [-1] * 6, dtype=map_type)
@@ -59,7 +58,7 @@ def test_native_prepare_mutates_only_owned_pinned_views(id_type, map_type):
 
 
 def test_invalid_mapping_and_buffers_fail_before_submission():
-    planner = native.NativeHostPlanner(4, 2, 0, 1, 2, 2, "load_balance", None, [0.0] * 4)
+    planner = native.NativeHostPlanner(4, 2, 0, 1, 2, 2, None, [0.0] * 4)
     with pytest.raises(ValueError, match="slot"):
         planner.plan([[0]], [[1.0]], [0, 0, -1, -1])
     with pytest.raises(ValueError, match="buffers"):

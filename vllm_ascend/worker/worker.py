@@ -95,6 +95,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.expert_offload.cpu_affinity import plan_cpu_moe_affinity
+from vllm_ascend.expert_offload.graph_capacity import validate_requested_decode_capacity
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -900,6 +902,17 @@ class NPUWorker(WorkerBase):
         return output
 
     def load_model(self) -> None:
+        cpu_moe = get_ascend_config().expert_offload_config.cpu_moe
+        if cpu_moe.enabled:
+            if not self.use_v2_model_runner and self.parallel_config.tensor_parallel_size == 1:
+                validate_requested_decode_capacity(
+                    cpu_moe.max_num_tokens, self.vllm_config, self.model_runner.uniform_decode_query_len
+                )
+            cpu_moe.startup_affinity = plan_cpu_moe_affinity(
+                cpu_moe,
+                resolve_physical_npu=lambda: current_platform.visible_device_id_to_physical_device_id(self.device.index),
+            )
+            logger.info("CPU MoE rank %s affinity plan: %s", self.local_rank, cpu_moe.startup_affinity)
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
@@ -1289,20 +1302,7 @@ class NPUWorker(WorkerBase):
                 "=YOUR_DIR_PATH_TO_DUMP_TRACE'"
             )
 
-        cpu_moe_trace_enabled = False
-        try:
-            from vllm_ascend.ascend_config import get_ascend_config
-            cpu_moe_trace_enabled = bool(
-                get_ascend_config().expert_offload_config.cpu_moe.enabled
-            )
-        except Exception:
-            # Profiling must remain independent of optional CPU-MoE setup.
-            cpu_moe_trace_enabled = False
-
         if is_start:
-            if cpu_moe_trace_enabled:
-                from vllm_ascend.expert_offload.transfer_trace import reset_transfer_traces
-                reset_transfer_traces()
             from vllm.distributed.utils import get_worker_rank_suffix
 
             rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
@@ -1327,11 +1327,6 @@ class NPUWorker(WorkerBase):
                 from vllm_ascend.expert_offload.cpu_backend.clock_calibration import record_clock_calibration
                 record_clock_calibration("end", self.profiler_config.torch_profiler_dir)
             self.profiler.stop()
-            if cpu_moe_trace_enabled:
-                from vllm_ascend.expert_offload.transfer_trace import dump_transfer_traces
-                transfer_trace_path = dump_transfer_traces(self.profiler_config.torch_profiler_dir)
-                if transfer_trace_path:
-                    logger.info("[NPU-TRANSFER-TRACE] saved %s", transfer_trace_path)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

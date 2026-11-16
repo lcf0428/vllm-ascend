@@ -1,6 +1,4 @@
 """Shared NZ must borrow the finalized weights without loading a checkpoint."""
-import ast
-from pathlib import Path
 import pytest
 import sys
 import types
@@ -8,12 +6,16 @@ import torch
 from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import KtKernelBackendConfig, KtKernelCPUExpertBackend
 
 
-def test_nz_resolves_without_weight_path():
-    config = KtKernelBackendConfig(0, 3, 3, 256, 256, "", weight_format="nz_mxfp4")
-    assert config.resolved_weight_path() == ""
+def test_nz_requires_shared_weights():
+    config = KtKernelBackendConfig(0, 3, 3, 256, 256)
+    with pytest.raises(RuntimeError, match="borrow finalized DMA source owners"):
+        KtKernelCPUExpertBackend(config)
 
 
-def test_nz_owner_is_forwarded_without_copy():
+def test_nz_owner_is_forwarded_without_copy(monkeypatch):
+    from vllm_ascend.expert_offload.cpu_backend import poll_submission
+
+    monkeypatch.setattr(poll_submission, "prepare", lambda _: None)
     owner = object()
     calls = []
 
@@ -32,38 +34,14 @@ def test_nz_owner_is_forwarded_without_copy():
         calls.append(kwargs)
         return Wrapper()
 
-    config = KtKernelBackendConfig(0, 3, 3, 256, 256, "", weight_format="nz_mxfp4")
+    config = KtKernelBackendConfig(0, 3, 3, 256, 256)
     KtKernelCPUExpertBackend(config, native_weights=owner, wrapper_factory=factory)
     assert calls[0]["native_weights"] is owner
-    assert calls[0]["weight_format"] == "nz_mxfp4"
 
 
 def test_nz_rejects_unsupported_numa_split():
     with pytest.raises(ValueError, match="one NUMA"):
-        KtKernelBackendConfig(0, 3, 3, 256, 256, "", threadpool_count=2, weight_format="nz_mxfp4")
-
-
-def test_invalid_weight_format_rejected():
-    with pytest.raises(ValueError, match="weight_format"):
-        KtKernelBackendConfig(0, 3, 3, 256, 256, "/unused", weight_format="invalid")
-
-
-def test_nz_service_config_requires_native_dispatch():
-    path = Path(__file__).parents[3] / "vllm_ascend/ascend_config.py"
-    node = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "CpuMoeConfig")
-    namespace = {}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    options = {
-        "enabled": True,
-        "layers": "all",
-        "weight_format": "nz_mxfp4",
-        "native_dispatch": True,
-    }
-    config = namespace["CpuMoeConfig"](options)
-    assert config.weight_format == "nz_mxfp4"
-    assert config.weight_path == ""
-    with pytest.raises(ValueError, match="native_dispatch"):
-        namespace["CpuMoeConfig"]({**options, "native_dispatch": False})
+        KtKernelBackendConfig(0, 3, 3, 256, 256, threadpool_count=2)
 
 
 def test_graph_registration_retains_warmup_buffers_across_sizes(monkeypatch):

@@ -27,7 +27,7 @@ def channel(expert,prefetch=False,dependency=None,slots=1,multiple=False):
  device_mapping=mapping.to('npu');original_mapping=device_mapping.clone()
  ready=torch_npu.npu.ExternalEvent();ready.reset();done=torch_npu.npu.ExternalEvent();done.reset()
  state=Policy(1,4,32,.9,1.,.5,.3,.01,False)
- planner=NativeHostPlanner(4,slots,0,100 if multiple else 0,101 if multiple else 1,2 if multiple else 1,'load_balance' if multiple else 'first_miss',state,[0.]*4)
+ planner=NativeHostPlanner(4,slots,0,100 if multiple else 2,101 if multiple else 3,2 if multiple else 1,state,[0.]*4)
  task=fixture.task();taskaddr=fixture.address(task)
  if prefetch:
   args=(hflag.data_ptr(),ids.data_ptr(),weights.data_ptr(),mapping.data_ptr(),int(ready.npu_event),1,ids.shape[1],0,8,4,1,planner)

@@ -1532,10 +1532,12 @@ class TestNPUWorker(TestBase):
             self.assertEqual(result, mock_model_output)
 
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
-    def test_load_model_with_sleep_mode(self, mock_allocator_class):
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_load_model_with_sleep_mode(self, mock_ascend_config, mock_allocator_class):
         """Test load_model method - with sleep mode enabled"""
         from vllm_ascend.worker.worker import NPUWorker
 
+        mock_ascend_config.return_value.expert_offload_config.cpu_moe.enabled = False
         # Create worker mock
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
@@ -1562,10 +1564,12 @@ class TestNPUWorker(TestBase):
             mock_allocator.use_memory_pool.assert_called_once_with(tag="weights")
             worker.model_runner.load_model.assert_called_once()
 
-    def test_load_model_without_sleep_mode(self):
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_load_model_without_sleep_mode(self, mock_ascend_config):
         """Test load_model method - without sleep mode enabled"""
         from vllm_ascend.worker.worker import NPUWorker
 
+        mock_ascend_config.return_value.expert_offload_config.cpu_moe.enabled = False
         # Create worker mock
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
@@ -1581,10 +1585,12 @@ class TestNPUWorker(TestBase):
             # Verify calls
             worker.model_runner.load_model.assert_called_once()
 
-    def test_load_model_leaves_prewarm_join_to_model_runner(self):
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_load_model_leaves_prewarm_join_to_model_runner(self, mock_ascend_config):
         """Joining prewarm threads belongs to the shared model load, not the worker."""
         from vllm_ascend.worker.worker import NPUWorker
 
+        mock_ascend_config.return_value.expert_offload_config.cpu_moe.enabled = False
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
             worker.model_runner = MagicMock()
@@ -1603,10 +1609,12 @@ class TestNPUWorker(TestBase):
             join_early.assert_not_called()
 
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
-    def test_load_model_sleep_mode_assertion_error(self, mock_allocator_class):
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    def test_load_model_sleep_mode_assertion_error(self, mock_ascend_config, mock_allocator_class):
         """Test load_model method - assertion error in sleep mode"""
         from vllm_ascend.worker.worker import NPUWorker
 
+        mock_ascend_config.return_value.expert_offload_config.cpu_moe.enabled = False
         # Create worker mock
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()

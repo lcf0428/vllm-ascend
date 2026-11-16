@@ -271,8 +271,12 @@ def begin_hybrid_routes(
         if getattr(executor.backend, "_host_transfer", None) is not None:
             from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import _graph_capture_active
             if _graph_capture_active():
-                raise ValueError("Graph batch exceeds CPU MoE capacity; increase cpu_moe.max_num_tokens. "
-                                 "Host callback paging is not a graph fallback")
+                raise ValueError(
+                    f"Graph batch exceeds CPU MoE capacity at model layer {executor.layer_idx}: "
+                    f"hidden tokens={hidden_states.shape[0]}, routing tokens={topk_ids.shape[0]}, "
+                    f"cpu_moe.max_num_tokens={backend_max_tokens}. "
+                    "Increase the CPU MoE capacity or reduce cudagraph_capture_sizes."
+                )
         return None
     # The hybrid path replaces update_weights, so it must perform the same
     # prefetch join before reading or modifying the device residency map.

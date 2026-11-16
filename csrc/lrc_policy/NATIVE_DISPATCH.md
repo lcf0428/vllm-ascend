@@ -1,8 +1,7 @@
 # Native CPU MoE graph dispatch
 
-`cpu_moe.native_dispatch=true` replaces the per-layer Python input producer,
-submission queue and result-completion worker during captured graph replay.
-The default remains false, preserving the original path for rollback.
+With CPU MoE enabled, the shared NZ backend uses the native input poll,
+submission and completion threads during captured graph replay.
 
 The input stream copies hidden states, routes and the resident mapping before
 publishing a monotonically increasing sequence to coherent pinned host memory.
@@ -55,19 +54,22 @@ bookkeeping across eager prewarm and multiple captured shapes.
 
 ## Route-weighted load balancing
 
-`load_balance` counts expert-token routes: one expert selected by two tokens is
-two CPU work units but one weight transfer. Missing experts are ranked by route
-frequency, then candidate transfer prefixes are evaluated with a simple model:
+Before graph capture, CPU MoE benchmarks one expert with one token, the same
+expert with two tokens, and the physical H2D fields for one expert. Benchmarks
+use scratch input and destination buffers and run once per expert geometry
+per worker. H2D is measured with Torch copy-stream events. The median
+measurements feed the demand planner and are logged at startup.
 
 ```text
-CPU(k) = remaining expert-token routes * balance_cpu_expert_us
-NPU(k) = k * balance_copy_us + balance_npu_fixed_us
+CPU(k) = remaining distinct experts * measured_first_route
+       + remaining extra routes * max(0, measured_two_routes - measured_first_route)
+NPU(k) = k * measured_one_expert_h2d + balance_npu_fixed_us
 choose k to minimize max(CPU(k), NPU(k))
 ```
 
-The fixed NPU estimate applies once per layer, including the no-transfer
-baseline. It accounts for NPU compute after weights arrive; it is not multiplied
-by the number of experts. The default is zero for backward compatibility; the
+Missing experts are ranked by route multiplicity, and the planner evaluates
+each candidate transfer count. The fixed NPU estimate applies once per layer,
+including the no-transfer baseline. The default is zero for backward compatibility; the
 measured setup explicitly uses 200 us. LRC chooses eligible eviction victims,
 while route frequency chooses which missing experts are worth moving to NPU.
 Python and native planning share the same integer-scaled cost comparison and

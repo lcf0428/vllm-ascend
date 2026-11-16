@@ -10,7 +10,7 @@ def policy():
 
 
 def planner(state):
-    return native.NativeHostPlanner(8, 3, 1, 70, 520, 32, 'load_balance', state, [0.] * 8)
+    return native.NativeHostPlanner(8, 3, 1, 70, 520, 32, state, [0.] * 8)
 
 
 def test_predictions_do_not_update_any_lrc_layer():

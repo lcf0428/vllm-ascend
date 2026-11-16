@@ -1517,7 +1517,9 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                     patch("vllm_ascend.worker.model_runner_v1.enable_dsa_cp", return_value=cp_enabled),
                     patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=enable_sp),
                     patch("vllm_ascend.worker.model_runner_v1.update_pass_config", return_value=nullcontext()),
+                    patch("vllm_ascend.worker.model_runner_v1.get_ascend_config") as ascend_config,
                 ):
+                    ascend_config.return_value.expert_offload_config.cpu_moe.enabled = False
                     runner._check_and_update_cudagraph_mode([], [])
                     dispatcher = runner.cudagraph_dispatcher
                     captured = set()
