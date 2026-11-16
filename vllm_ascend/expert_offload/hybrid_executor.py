@@ -282,9 +282,13 @@ def begin_hybrid_routes(
     # prefetch join before reading or modifying the device residency map.
     if transfer_manager is not None:
         import torch_npu
-        transfer_manager._finish_pending_predict(executor.layer_idx)
+
+        # Prefetch state uses the manager ordinal. The executor keeps the
+        # model layer index for its CPU backend.
+        offload_layer_idx = layer.offload_layer_idx
+        transfer_manager._finish_pending_predict(offload_layer_idx)
         with transfer_manager._prefetch_state_lock:
-            pending_event = transfer_manager._prefetch_layer_npu_event.pop(executor.layer_idx, None)
+            pending_event = transfer_manager._prefetch_layer_npu_event.pop(offload_layer_idx, None)
         if pending_event is not None:
             try:
                 torch_npu.npu.current_stream().wait_event(pending_event)

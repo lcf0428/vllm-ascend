@@ -9,6 +9,9 @@ next-layer prefetch. Remove `backend`, `transfer_copy_library`,
 `transfer_trace_capacity`, and `transfer_trace_mode` from old CPU MoE
 configurations. Remove `transfer_policy` and `transfer_scheduler` as well. The CPU MoE host planner always balances CPU work and weight DMA.
 
+CPU MoE prefetch supports `expert_predictor="fate"`. Selecting a trained
+predictor with CPU MoE prefetch enabled fails configuration validation.
+
 ## Runtime dependencies
 
 Build the CPU-only LRC extension before starting the service:

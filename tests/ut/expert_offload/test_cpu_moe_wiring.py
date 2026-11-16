@@ -1,4 +1,5 @@
 import ast
+import os
 import sys
 import types
 from pathlib import Path
@@ -11,15 +12,53 @@ import vllm_ascend.expert_offload.cpu_backend.wiring as wiring
 
 
 @pytest.fixture
-def cpu_config_class():
-    # Exercise the production class without importing the unrelated full
-    # Ascend configuration/worker dependency graph.
+def config_classes():
+    # Exercise the production classes without importing the full worker dependency graph.
     path = Path(wiring.__file__).parents[2] / "ascend_config.py"
-    tree = ast.parse(path.read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "CpuMoeConfig")
-    namespace = {}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    return namespace["CpuMoeConfig"]
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    nodes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name in ("CpuMoeConfig", "ExpertOffloadConfig")]
+    namespace = {"os": os}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    return namespace
+
+
+@pytest.fixture
+def cpu_config_class(config_classes):
+    return config_classes["CpuMoeConfig"]
+
+
+@pytest.fixture
+def offload_config_class(config_classes, monkeypatch):
+    predictors = SimpleNamespace(valid_predictor_names=lambda: ["fate", "mode2_har", "mode2_prevhfr"])
+    monkeypatch.setitem(sys.modules, "vllm_ascend.expert_offload.expert_predictor", predictors)
+    return config_classes["ExpertOffloadConfig"]
+
+
+@pytest.mark.parametrize("predictor", ["mode2_har", "mode2_prevhfr"])
+def test_cpu_moe_rejects_trained_prefetch_at_startup(offload_config_class, tmp_path, predictor):
+    checkpoint = tmp_path / "predictor.pt"
+    checkpoint.touch()
+    config = {
+        "expert_offload": True,
+        "expert_prefetch_enabled": True,
+        "expert_predictor": predictor,
+        "expert_predictor_ckpt": str(checkpoint),
+    }
+    paging = offload_config_class(config)
+    assert not paging.cpu_moe.enabled
+    assert paging.expert_predictor == predictor
+    with pytest.raises(ValueError, match=f"CPU MoE prefetch only supports expert_predictor='fate'; got '{predictor}'"):
+        offload_config_class({**config, "cpu_moe": {"enabled": True}})
+
+
+@pytest.mark.parametrize("prefetch_enabled", [False, True])
+def test_cpu_moe_accepts_default_fate(offload_config_class, prefetch_enabled):
+    config = offload_config_class({
+        "expert_offload": True,
+        "expert_prefetch_enabled": prefetch_enabled,
+        "cpu_moe": {"enabled": True},
+    })
+    assert config.expert_predictor == "fate"
 
 
 def test_cpu_config_disabled_by_default(cpu_config_class):

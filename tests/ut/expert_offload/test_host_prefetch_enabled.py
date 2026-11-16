@@ -51,11 +51,16 @@ def test_prefetch_join_precedes_demand_preparation(monkeypatch, pending):
 
     operations = []
     event = object()
-    executor = SimpleNamespace(layer_idx=2, backend=SimpleNamespace(max_num_tokens=48))
+    other_event = object()
+    layer = SimpleNamespace(offload_layer_idx=1)
+    executor = SimpleNamespace(layer_idx=3, backend=SimpleNamespace(max_num_tokens=48))
+    events = {3: other_event}
+    if pending:
+        events[1] = event
     manager = SimpleNamespace(
-        _finish_pending_predict=lambda i: operations.append("predict_join"),
+        _finish_pending_predict=lambda i: operations.append(("predict_join", i)),
         _prefetch_state_lock=threading.Lock(),
-        _prefetch_layer_npu_event={2: event} if pending else {},
+        _prefetch_layer_npu_event=events,
         offload_config=SimpleNamespace(expert_substitution_enabled=False),
     )
     stream = SimpleNamespace(wait_event=lambda e: operations.append(("prefetch_join", e)))
@@ -63,9 +68,11 @@ def test_prefetch_join_precedes_demand_preparation(monkeypatch, pending):
     monkeypatch.setattr(forward, "is_forward_context_available", lambda: False)
     monkeypatch.setattr(torch_npu.npu, "current_stream", lambda: stream)
     monkeypatch.setattr(hybrid, "PreparedHybridRoutes", lambda *a, **k: operations.append("demand_prepare"))
-    hybrid.begin_hybrid_routes(object(), hidden_states=torch.zeros(1, 4),
+    hybrid.begin_hybrid_routes(layer, hidden_states=torch.zeros(1, 4),
                                topk_ids=torch.tensor([[0]]), topk_weights=torch.ones(1, 1),
                                log2phy=torch.tensor([0]), transfer_manager=manager)
-    assert operations == (["predict_join", ("prefetch_join", event), "demand_prepare"]
-                          if pending else ["predict_join", "demand_prepare"])
-    assert not manager._prefetch_layer_npu_event
+    expected = [("predict_join", 1)]
+    if pending:
+        expected.append(("prefetch_join", event))
+    assert operations == [*expected, "demand_prepare"]
+    assert manager._prefetch_layer_npu_event == {3: other_event}

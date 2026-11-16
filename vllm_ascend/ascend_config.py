@@ -2117,6 +2117,8 @@ class ExpertOffloadConfig:
             raise TypeError("expert_predictor must be a string")
         if predictor not in valid_predictor_names():
             raise ValueError(f"unknown expert_predictor {predictor!r}; valid names: {valid_predictor_names()}")
+        if self.cpu_moe.enabled and self.expert_prefetch_enabled and predictor != "fate":
+            raise ValueError(f"CPU MoE prefetch only supports expert_predictor='fate'; got {predictor!r}")
         ckpt = self.config["expert_predictor_ckpt"]
         if ckpt is not None and not isinstance(ckpt, str):
             raise TypeError("expert_predictor_ckpt must be a string or null")
