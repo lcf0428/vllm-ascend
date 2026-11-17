@@ -23,7 +23,6 @@ import torch_npu
 from vllm.config import ProfilerConfig
 from vllm.profiler.wrapper import WorkerProfiler
 
-import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 
 
@@ -32,6 +31,7 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
 
     def __init__(self, profiler_config: ProfilerConfig, trace_name: str) -> None:
         super().__init__(profiler_config)
+        self._cpu_moe_anchor_directory = profiler_config.torch_profiler_dir
         self.profiler: Any = self._create_profiler(profiler_config, trace_name)
 
     @staticmethod
@@ -40,17 +40,19 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             raise RuntimeError(f"Unrecognized profiler: {profiler_config.profiler}")
         if not profiler_config.torch_profiler_dir:
             raise RuntimeError("torch_profiler_dir cannot be empty.")
-        msmonitor_use_daemon = envs_ascend.MSMONITOR_USE_DAEMON
+        msmonitor_use_daemon = False
         with suppress(RuntimeError):
             msmonitor_use_daemon = get_ascend_config().msmonitor_use_daemon
         if msmonitor_use_daemon:
-            raise RuntimeError("MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.")
+            raise RuntimeError(
+                "additional_config.msmonitor_use_daemon and torch profiler cannot be enabled at the same time."
+            )
 
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             msprof_tx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
             op_attr=False,
             data_simplification=True,
@@ -75,10 +77,41 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             ),
         )
 
+    @staticmethod
+    def _set_cpu_moe_capture(enabled: bool, directory=None) -> None:
+        # Optional kt backend: enable detailed native events only in a capture.
+        with suppress(ImportError):
+            from kt_kernel import kt_kernel_ext
+            setter = getattr(kt_kernel_ext, "set_lifecycle_enabled", None)
+            if setter is not None:
+                setter(enabled)
+        with suppress(ImportError):
+            from vllm_ascend.expert_offload.cpu_backend import poll_submission
+            worker = poll_submission._WORKER
+            if worker is not None and hasattr(worker, 'set_dma_capture'):
+                worker.set_dma_capture(enabled, directory)
+
     def _start(self) -> None:
+        import os
+        import torch
+        if os.environ.get("CPU_MOE_CLOCK_ANCHORS") == "1":
+            torch.npu.synchronize()
         self.profiler.start()
+        if os.environ.get("CPU_MOE_CLOCK_ANCHORS") == "1":
+            from vllm_ascend.expert_offload.cpu_backend.clock_anchor_helper import record_clock_anchor
+            record_clock_anchor("start", self._cpu_moe_anchor_directory)
+        self._set_cpu_moe_capture(True, self._cpu_moe_anchor_directory)
 
     def _stop(self) -> None:
+        import os
+        import torch
+        if os.environ.get("CPU_MOE_CLOCK_ANCHORS") == "1":
+            # Caller must finish benchmark responses before requesting stop.
+            # Drain queued NPU work, including CPU callback result transfers.
+            torch.npu.synchronize()
+            from vllm_ascend.expert_offload.cpu_backend.clock_anchor_helper import record_clock_anchor
+            record_clock_anchor("stop", self._cpu_moe_anchor_directory)
+        self._set_cpu_moe_capture(False, self._cpu_moe_anchor_directory)
         self.profiler.stop()
 
     def _profiler_step(self) -> bool:

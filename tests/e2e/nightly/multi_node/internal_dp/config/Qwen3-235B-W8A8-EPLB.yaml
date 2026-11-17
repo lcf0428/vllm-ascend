@@ -1,4 +1,4 @@
-test_name: "test Qwen3-235B-A22B-W8A8 disaggregated_prefill"
+test_name: "test Qwen3-235B-A22B-W8A8 EPLB"
 model: "vllm-ascend/Qwen3-235B-A22B-W8A8"
 num_nodes: 2
 npu_per_node: 16
@@ -10,7 +10,7 @@ env_common: &env_common
   OMP_NUM_THREADS: 1
   HCCL_BUFFSIZE: 1024
   SERVER_PORT: 8080
-  DYNAMIC_EPLB: true
+  VLLM_USE_V2_MODEL_RUNNER: "1"
 disaggregated_prefill:
   enabled: true
   prefiller_host_index: [0]
@@ -39,8 +39,7 @@ deployment:
         --kv-transfer-config
         '{"kv_connector": "MooncakeConnectorV1",
         "kv_role": "kv_producer",
-        "kv_port": "36000",
-        "engine_id": "0",
+        "kv_port": "30000",
         "kv_connector_extra_config": {
                   "prefill": {
                           "dp_size": 2,
@@ -52,8 +51,10 @@ deployment:
                   }
             }
         }'
+        --enable-eplb
+        --eplb-config '{"window_size":50,"step_interval":5,"num_redundant_experts":0,"use_async":true,"log_balancedness":false}'
         --additional-config
-        '{"eplb_config": {"dynamic_eplb":true,"expert_heat_collection_interval":2048,"algorithm_execution_interval":200}}'
+        '{"eplb_config":{"load_collection_phase":"all"}}'
 
   -
     envs:
@@ -77,8 +78,7 @@ deployment:
         --kv-transfer-config
         '{"kv_connector": "MooncakeConnectorV1",
         "kv_role": "kv_consumer",
-        "kv_port": "36100",
-        "engine_id": "1",
+        "kv_port": "30200",
         "kv_connector_extra_config": {
                   "prefill": {
                           "dp_size": 2,
@@ -90,6 +90,8 @@ deployment:
                   }
             }
         }'
+        --enable-eplb
+        --eplb-config '{"window_size":600,"step_interval":50,"num_redundant_experts":0,"use_async":true,"log_balancedness":false}'
         --additional-config
-        '{"eplb_config": {"dynamic_eplb":true,"expert_heat_collection_interval":2048,"algorithm_execution_interval":200}}'
+        '{"eplb_config":{"load_collection_phase":"all"}}'
 benchmarks:

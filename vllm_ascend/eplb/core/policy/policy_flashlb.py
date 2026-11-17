@@ -473,21 +473,23 @@ class FlashTree:
 
             initial_replicas = (simulation_replicas[:interval_size] - 1).sum()
 
+            def neighbor_score(
+                mid,
+                ci=current_idx,
+                crf=current_replicas_f,
+                ri=remaind_idx,
+                rrf=remaind_replicas_f,
+                nar=num_available_replicas,
+            ):
+                return get_score(_lpt_deployment, X_row, deployed_replicas, ci, crf[mid], ri, rrf[nar - mid])
+
             best_replica, _, _ = self.neighbor_search(
                 low,
                 high,
                 initial_replicas,
                 width,
-                lambda mid,
-                ci=current_idx,
-                crf=current_replicas_f,
-                ri=remaind_idx,
-                rrf=remaind_replicas_f,
-                nar=num_available_replicas: get_score(
-                    _lpt_deployment, X_row, deployed_replicas, ci, crf[mid], ri, rrf[nar - mid]
-                ),
+                neighbor_score,
             )
-
             deployed_replicas[current_idx] = current_replicas_f[best_replica]
             num_available_replicas -= best_replica
 
@@ -867,7 +869,7 @@ class FlashLB(EplbPolicy):
                     self.update_threshold_value = 0.9
                     self.true_update = True
             except Exception:
-                logger.info("Dynamic eplb group is not initialized now")
+                logger.info("[eplb/policy] Dynamic eplb group not initialized yet, using default thresholds")
         current_deployment = np.array(current_expert_table)
         expert_workload = np.array(expert_workload)
 

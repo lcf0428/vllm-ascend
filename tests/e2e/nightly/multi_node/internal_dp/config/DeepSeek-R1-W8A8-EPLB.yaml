@@ -12,7 +12,8 @@ env_common: &env_common
   HCCL_DETERMINISTIC: True
   TASK_QUEUE_ENABLE: 1
   HCCL_OP_RETRY_ENABLE: "L0:0, L1:0, L2:0"
-  DYNAMIC_EPLB: true
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_ENGINE_READY_TIMEOUT_S: 3000
 
 disaggregated_prefill:
   enabled: true
@@ -44,7 +45,6 @@ deployment:
           '{"kv_connector": "MooncakeConnectorV1",
           "kv_role": "kv_producer",
           "kv_port": "30000",
-          "engine_id": "0",
           "kv_connector_extra_config": {
                     "prefill": {
                             "dp_size": 2,
@@ -56,8 +56,10 @@ deployment:
                     }
               }
           }'
+          --enable-eplb
+          --eplb-config '{"window_size":2048,"step_interval":200,"num_redundant_experts":0,"use_async":true,"log_balancedness":false}'
           --additional-config
-          '{"enable_prefill_optimizations":true,"enable_weight_nz_layout":true,"eplb_config": {"dynamic_eplb":true,"expert_heat_collection_interval":2048,"algorithm_execution_interval":200}}'
+          '{"weight_nz_mode":1,"eplb_config":{"load_collection_phase":"all"}}'
 
   -
     envs:
@@ -83,7 +85,6 @@ deployment:
           '{"kv_connector": "MooncakeConnectorV1",
           "kv_role": "kv_producer",
           "kv_port": "30100",
-          "engine_id": "1",
           "kv_connector_extra_config": {
                     "prefill": {
                             "dp_size": 2,
@@ -95,8 +96,10 @@ deployment:
                     }
               }
           }'
+          --enable-eplb
+          --eplb-config '{"window_size":2048,"step_interval":200,"num_redundant_experts":0,"use_async":true,"log_balancedness":false}'
           --additional-config
-          '{"enable_prefill_optimizations":true,"enable_weight_nz_layout":true,"eplb_config": {"dynamic_eplb":true,"expert_heat_collection_interval":2048,"algorithm_execution_interval":200}}'
+          '{"weight_nz_mode":1,"eplb_config":{"load_collection_phase":"all"}}'
   -
     envs:
       <<: *env_common
@@ -106,7 +109,6 @@ deployment:
         --port $SERVER_PORT
         --data-parallel-size 32
         --data-parallel-size-local 16
-        --data-parallel-start-rank 0
         --data-parallel-address $LOCAL_IP
         --data-parallel-rpc-port 13389
         --tensor-parallel-size 1
@@ -123,7 +125,6 @@ deployment:
         '{"kv_connector": "MooncakeConnectorV1",
         "kv_role": "kv_consumer",
         "kv_port": "30200",
-        "engine_id": "2",
         "kv_connector_extra_config": {
                   "prefill": {
                           "dp_size": 2,
@@ -135,8 +136,10 @@ deployment:
                   }
             }
         }'
+        --enable-eplb
+        --eplb-config '{"window_size":2048,"step_interval":200,"num_redundant_experts":0,"use_async":true,"log_balancedness":false}'
         --additional-config
-        '{"multistream_overlap_shared_expert":true,"dynamic_eplb":true,"expert_heat_collection_interval":2048,"algorithm_execution_interval":200}'
+        '{"multistream_overlap_shared_expert":true,"eplb_config":{"load_collection_phase":"all"}}'
   -
     envs:
       <<: *env_common
@@ -162,7 +165,6 @@ deployment:
         '{"kv_connector": "MooncakeConnectorV1",
         "kv_role": "kv_consumer",
         "kv_port": "30200",
-        "engine_id": "2",
         "kv_connector_extra_config": {
                   "prefill": {
                           "dp_size": 2,
@@ -174,8 +176,10 @@ deployment:
                   }
             }
         }'
+        --enable-eplb
+        --eplb-config '{"window_size":2048,"step_interval":200,"num_redundant_experts":0,"use_async":true,"log_balancedness":false}'
         --additional-config
-        '{"multistream_overlap_shared_expert":true,"eplb_config": {"dynamic_eplb":true,"expert_heat_collection_interval":2048,"algorithm_execution_interval":200}}'
+        '{"multistream_overlap_shared_expert":true,"eplb_config":{"load_collection_phase":"all"}}'
 benchmarks:
   perf:
     case_type: performance

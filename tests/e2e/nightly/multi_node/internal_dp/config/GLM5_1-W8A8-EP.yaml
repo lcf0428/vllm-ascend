@@ -16,11 +16,10 @@ env_common: &env_common
   ACL_OP_INIT_MODE: 1
   ASCEND_A3_ENABLE: 1
   VLLM_NIXL_ABORT_REQUEST_TIMEOUT: "300000"
-  VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+  VLLM_ENGINE_READY_TIMEOUT_S: "3000"
   HCCL_CONNECT_TIMEOUT: "1200"
   HCCL_INTRA_PCIE_ENABLE: 1
   HCCL_INTRA_ROCE_ENABLE: 0
-  VLLM_ASCEND_ENABLE_FUSED_MC2: 1
 
 special_dependencies:
   transformers: "5.2.0"
@@ -35,14 +34,12 @@ deployment:
   -
     envs:
       <<: *env_common
-      VLLM_ASCEND_ENABLE_FLASHCOMM1: 1
     server_cmd: >
       vllm serve Eco-Tech/GLM-5.1-w8a8
           --host 0.0.0.0
           --port $SERVER_PORT
           --data-parallel-size 4
           --data-parallel-size-local 2
-          --data-parallel-start-rank 0
           --data-parallel-address $LOCAL_IP
           --tensor-parallel-size 8
           --enable-expert-parallel
@@ -53,7 +50,7 @@ deployment:
           "torch_profiler_with_stack": false}'
           --seed 1024
           --max-model-len 131072
-          --additional-config '{"recompute_scheduler_enable": true, "fuse_muls_add": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}'
+          --additional-config '{"ascend_compilation_config": {"enable_npugraph_ex": true},"enable_fused_mc2":1}'
           --max-num-batched-tokens 4096
           --trust-remote-code
           --max-num-seqs 64
@@ -67,7 +64,6 @@ deployment:
           '{"kv_connector": "MooncakeConnectorV1",
           "kv_role": "kv_producer",
           "kv_port": "30000",
-          "engine_id": "0",
           "kv_connector_extra_config": {
                     "use_ascend_direct": true,
                     "prefill": {
@@ -83,7 +79,6 @@ deployment:
   -
     envs:
       <<: *env_common
-      VLLM_ASCEND_ENABLE_FLASHCOMM1: 1
     server_cmd: >
       vllm serve Eco-Tech/GLM-5.1-w8a8
           --host 0.0.0.0
@@ -102,7 +97,7 @@ deployment:
           "torch_profiler_with_stack": false}'
           --seed 1024
           --max-model-len 131072
-          --additional-config '{"recompute_scheduler_enable": true, "fuse_muls_add": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}'
+          --additional-config '{"ascend_compilation_config": {"enable_npugraph_ex": true},"enable_fused_mc2":1}'
           --max-num-batched-tokens 4096
           --trust-remote-code
           --max-num-seqs 64
@@ -116,7 +111,6 @@ deployment:
           '{"kv_connector": "MooncakeConnectorV1",
           "kv_role": "kv_producer",
           "kv_port": "30000",
-          "engine_id": "0",
           "kv_connector_extra_config": {
                     "use_ascend_direct": true,
                     "prefill": {
@@ -132,7 +126,6 @@ deployment:
   -
     envs:
       <<: *env_common
-      VLLM_ASCEND_ENABLE_MLAPO: 1
       TASK_QUEUE_ENABLE: 1
     server_cmd: >
       vllm serve Eco-Tech/GLM-5.1-w8a8
@@ -140,7 +133,6 @@ deployment:
           --port $SERVER_PORT
           --data-parallel-size 8
           --data-parallel-size-local 4
-          --data-parallel-start-rank 0
           --data-parallel-address $LOCAL_IP
           --data-parallel-rpc-port 10543
           --tensor-parallel-size 4
@@ -154,7 +146,7 @@ deployment:
           --max-model-len 202752
           --max-num-batched-tokens 32
           --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[4, 8, 12, 16,20,24,28, 32]}'
-          --additional-config '{"recompute_scheduler_enable": true, "fuse_muls_add": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}'
+          --additional-config '{"recompute_scheduler_enable": true, "ascend_compilation_config": {"enable_npugraph_ex": true},"enable_fused_mc2":1,"enable_mlapo":true}'
           --trust-remote-code
           --max-num-seqs 8
           --gpu-memory-utilization 0.92
@@ -166,7 +158,6 @@ deployment:
           '{"kv_connector": "MooncakeConnectorV1",
           "kv_role": "kv_consumer",
           "kv_port": "30100",
-          "engine_id": "1",
           "kv_connector_extra_config": {
                     "use_ascend_direct": true,
                     "prefill": {
@@ -182,7 +173,6 @@ deployment:
   -
     envs:
       <<: *env_common
-      VLLM_ASCEND_ENABLE_MLAPO: 1
       TASK_QUEUE_ENABLE: 1
     server_cmd: >
       vllm serve Eco-Tech/GLM-5.1-w8a8
@@ -205,7 +195,7 @@ deployment:
           --max-model-len 202752
           --max-num-batched-tokens 32
           --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[4, 8, 12, 16,20,24,28, 32]}'
-          --additional-config '{"recompute_scheduler_enable": true, "fuse_muls_add": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}'
+          --additional-config '{"recompute_scheduler_enable": true, "ascend_compilation_config": {"enable_npugraph_ex": true},"enable_fused_mc2":1,"enable_mlapo":true}'
           --trust-remote-code
           --max-num-seqs 8
           --gpu-memory-utilization 0.92
@@ -217,7 +207,6 @@ deployment:
           '{"kv_connector": "MooncakeConnectorV1",
           "kv_role": "kv_consumer",
           "kv_port": "30100",
-          "engine_id": "1",
           "kv_connector_extra_config": {
                     "use_ascend_direct": true,
                     "prefill": {
@@ -240,5 +229,5 @@ benchmarks:
     max_out_len: 1500
     batch_size: 40
     request_rate: 0
-    baseline: 1
+    baseline: 1231.1406
     threshold: 0.97

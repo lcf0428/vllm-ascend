@@ -188,6 +188,7 @@ if (BUILD_OPEN_PROJECT)
             error_manager
             ascendalog
             unified_dlog
+            ascendcl
             -Wl,--as-needed
             -Wl,--whole-archive
             tiling_api
@@ -870,7 +871,7 @@ if (NOT ENABLE_BUILT_IN AND BUILD_OPEN_PROJECT)
     set(CPACK_PACKAGE_DIRECTORY ${CMAKE_BINARY_DIR})
     set(CPACK_PACKAGE_FILE_NAME "cann-ops-transformer-${VENDOR_NAME}_linux-${ARCH}.run")
     set(CPACK_GENERATOR External)
-    set(CPACK_CMAKE_GENERATOR "Unix Makefiles")
+    set(CPACK_CMAKE_GENERATOR "${CMAKE_GENERATOR}")
     set(CPACK_EXTERNAL_ENABLE_STAGING TRUE)
     if (ENABLE_BUILD_PKG)
       if (EXISTS ${ASCEND_CMAKE_DIR}/makeself.cmake)

@@ -9,6 +9,39 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 
 
+def _get_sparse_index_kpool(model_config) -> int | None:
+    """Return the active sparse index-kpool ratio, if configured."""
+    for config_name in ("hf_text_config", "hf_config"):
+        config = getattr(model_config, config_name, None)
+        if config is None or getattr(config, "index_topk", None) is None:
+            continue
+        if not hasattr(config, "index_kpool"):
+            continue
+        index_kpool = config.index_kpool
+        if not isinstance(index_kpool, int) or index_kpool <= 1:
+            raise ValueError("Sparse index-kpool models require index_kpool to be an integer greater than 1.")
+        return index_kpool
+    return None
+
+
+def _using_kv_store(vllm_config) -> bool:
+    """
+    Check whether AscendStoreConnector is used.
+    In the scenario where only PD separation is used, mamba_cache_mode is not automatically set to align.
+    """
+    if not vllm_config.kv_transfer_config:
+        return False
+    if vllm_config.kv_transfer_config.kv_connector == "AscendStoreConnector":
+        return True
+    if vllm_config.kv_transfer_config.kv_connector == "MultiConnector":
+        kv_connector_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        if not kv_connector_extra_config:
+            return False
+        if connectors := kv_connector_extra_config.get("connectors"):
+            return any(connector.get("kv_connector") == "AscendStoreConnector" for connector in connectors)
+    return False
+
+
 @classmethod
 def verify_and_update_config(cls, vllm_config) -> None:
     """
@@ -21,6 +54,10 @@ def verify_and_update_config(cls, vllm_config) -> None:
     Args:
         vllm_config: vLLM Config
     """
+    using_kv_store_with_hybrid = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and _using_kv_store(
+        vllm_config
+    )
+    logger.debug("Using kv store: %s", using_kv_store_with_hybrid)
     # Enable FULL_AND_PIECEWISE by default
     MambaModelConfig.verify_and_update_config(vllm_config)
 
@@ -46,6 +83,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     for shape, dtype in zip(mamba_shapes, mamba_dtypes):
         mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
     ssm_block_page_size, conv_block_page_size = max(mamba_sizes), min(mamba_sizes)
+    mamba_raw_page_size = sum(mamba_sizes)
 
     # Pure linear attention models (e.g. bailing 2.5) have only SSM state,
     # no conv block. Detected by a single 3-D mamba shape (ssm only, no conv).
@@ -69,37 +107,78 @@ def verify_and_update_config(cls, vllm_config) -> None:
         attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
         attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
 
-    attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
-    assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
-        "Cannot align ssm_page_size and attn_page_size."
-    )
-
-    # override attention block size if either (a) the
-    # user has not set it or (b) the user has set it
-    # too small.
-    if cache_config.block_size is None or cache_config.block_size < attn_block_size:
-        cache_config.block_size = attn_block_size
-        logger.info(
-            "Setting attention block size to %d tokens to ensure that attention page size is >= mamba page size.",
-            attn_block_size,
+    index_kpool = _get_sparse_index_kpool(model_config)
+    if index_kpool is not None:
+        # The compressed indexer storage block is consumed by a CANN kernel
+        # whose block size must be a multiple of 16. Keep the scheduler block
+        # C128-aligned while making block_size / index_kpool C16-aligned too.
+        alignment_tokens = math.lcm(kernel_block_size, index_kpool * 16)
+        min_block_size = cdiv(mamba_raw_page_size, attn_token_page_size)
+        requested_block_size = cache_config.block_size or kernel_block_size
+        attn_block_size = alignment_tokens * cdiv(max(requested_block_size, min_block_size), alignment_tokens)
+        if cache_config.block_size != attn_block_size:
+            cache_config.block_size = attn_block_size
+            logger.info(
+                "Setting attention block size to %d tokens to align MLA, "
+                "recurrent-state, and compressed indexer cache pages.",
+                attn_block_size,
+            )
+    else:
+        attn_block_size = kernel_block_size * cdiv(
+            ssm_block_page_size,
+            kernel_block_size * attn_single_token_k_page_size,
         )
+        assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
+            "Cannot align ssm_page_size and attn_page_size."
+        )
+
+        # Override attention block size if it is unset or too small.
+        if cache_config.block_size is None or cache_config.block_size < attn_block_size:
+            cache_config.block_size = attn_block_size
+            logger.info(
+                "Setting attention block size to %d tokens to ensure that attention page size is >= mamba page size.",
+                attn_block_size,
+            )
 
     # compute new attention page size
     attn_page_size = cache_config.block_size * attn_token_page_size
 
-    # pad mamba page size for conv_blocks
-    if (
-        cache_config.mamba_page_size_padded is None
-        or cache_config.mamba_page_size_padded != attn_page_size + conv_block_page_size
-    ):
-        cache_config.mamba_page_size_padded = attn_page_size + conv_block_page_size
-        mamba_padding_pct = 100 * conv_block_page_size / cache_config.mamba_page_size_padded
+    # Sparse index-kpool models pack the complete recurrent state into the
+    # same large-page class as attention. Preserve the generic Ascend SSM+conv
+    # layout for other hybrid models.
+    target_mamba_page_size = (
+        max(attn_page_size, mamba_raw_page_size) if index_kpool is not None else attn_page_size + conv_block_page_size
+    )
+    if cache_config.mamba_page_size_padded is None or cache_config.mamba_page_size_padded != target_mamba_page_size:
+        cache_config.mamba_page_size_padded = target_mamba_page_size
+        padding_bytes = (
+            target_mamba_page_size - mamba_raw_page_size if index_kpool is not None else conv_block_page_size
+        )
+        mamba_padding_pct = 100 * padding_bytes / target_mamba_page_size
         logger.info(
             "Padding mamba page size by %.2f%% to ensure "
             "that mamba page size and attention page size are "
             "exactly equal.",
             mamba_padding_pct,
         )
+    # The extract_hidden_states connector (ExampleHiddenStatesConnector) only
+    # manages the dedicated hidden-state cache-only layer; it does not migrate
+    # mamba KV blocks across instances, so it does not require the block-aligned
+    # mamba cache mode. Forcing "align" for it would route hybrid models onto
+    # vLLM's fused GPU postprocess Triton kernel (introduced in vLLM #40172),
+    # which the Ascend Triton backend cannot compile. Leave the mode as vLLM
+    # derived it (e.g. "none" when prefix caching is off) for this case.
+    spec_config = vllm_config.speculative_config
+    is_extract_hidden_states = (
+        spec_config is not None and getattr(spec_config, "method", None) == "extract_hidden_states"
+    )
+    if using_kv_store_with_hybrid and not is_extract_hidden_states:
+        if cache_config.mamba_cache_mode == "none":
+            cache_config.mamba_cache_mode = "align"
+        else:
+            assert cache_config.mamba_cache_mode == "align", (
+                "mamba_cache_mode only support 'align' when kv_transfer enabled now!"
+            )
     if cache_config.enable_prefix_caching and cache_config.mamba_cache_mode == "align":
         cache_config.mamba_block_size = cache_config.block_size
     else:
